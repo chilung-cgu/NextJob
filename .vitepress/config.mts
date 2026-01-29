@@ -42,10 +42,13 @@ export default defineConfig({
   themeConfig: {
     // https://vitepress.dev/reference/default-theme-config
     nav: [
-      { text: '首頁', link: '/' },
       { text: '學習計劃', link: '/01_學習計劃/技能評估表' },
       { text: 'C語言', link: '/02_C語言/位元運算練習' },
-      { text: 'OpenBMC', link: '/04_OpenBMC深化/架構複習' }
+      { text: '驅動開發', link: '/03_底層驅動開發/I2C_SPI_UART' },
+      { text: 'OpenBMC', link: '/04_OpenBMC深化/架構複習' },
+      { text: 'OS', link: '/05_作業系統/Bootloader' },
+      { text: '面試', link: '/06_面試準備/履歷範本' },
+      { text: '專案', link: '/07_練習專案/專案清單' }
     ],
 
     sidebar: getSidebar(),
