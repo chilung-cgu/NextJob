@@ -6,18 +6,18 @@ import fs from 'fs'
 // 自動生成側邊欄的 helper function
 function getSidebar() {
   const sidebar = {}
-  
+
   // 找出所有第一層的目錄 (e.g., 01_學習計劃, 02_C語言...)
   const dirs = fs.readdirSync(__dirname + '/..').filter(f => {
-    return fs.statSync(__dirname + '/../' + f).isDirectory() && 
-           !f.startsWith('.') && 
-           f !== 'node_modules'
+    return fs.statSync(__dirname + '/../' + f).isDirectory() &&
+      !f.startsWith('.') &&
+      f !== 'node_modules'
   }).sort()
 
   dirs.forEach(dir => {
     // 針對每個目錄，找出裡面的 .md 檔案
     const files = globSync(`${dir}/*.md`, { cwd: path.resolve(__dirname, '..') }).sort()
-    
+
     if (files.length > 0) {
       sidebar[`/${dir}/`] = [
         {
@@ -36,6 +36,7 @@ function getSidebar() {
 
 // https://vitepress.dev/reference/site-config
 export default defineConfig({
+  base: '/NextJob/',
   title: "NextJob 韌體面試庫",
   description: "BMC / System Firmware Engineer Interview Preparation",
   themeConfig: {
