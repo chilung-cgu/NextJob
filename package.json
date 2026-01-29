@@ -1,0 +1,20 @@
+{
+  "name": "nextjob",
+  "version": "1.0.0",
+  "description": "> **目標職位**：NVIDIA / AMD / Intel 的 BMC/系統管理韌體工程師   > **準備時間**：2-3 個月   > **你的優勢**：已有 OpenBMC 經驗，可直接運用",
+  "main": "index.js",
+  "scripts": {
+    "docs:dev": "vitepress dev",
+    "docs:build": "vitepress build",
+    "docs:preview": "vitepress preview"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "glob": "^13.0.0",
+    "vitepress": "^1.6.4",
+    "vue": "^3.5.27"
+  }
+}
