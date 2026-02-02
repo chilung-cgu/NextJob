@@ -4,13 +4,23 @@ description: 重新打造 NextJob 外商韌體面試聖經 (觸發完整內容�
 
 # 🚀 Rebuild NextJob 外商韌體面試聖經
 
-此 Workflow 搭配 `deep-expansion` Skill 使用，逐章節深度擴充學習資料。
+此 Workflow 搭配 Skill 和詳細指令使用，逐章節深度擴充學習資料。
 
 ---
 
-## Step 1: 讀取品質標準
+## Step 1: 讀取規則文件
 
-閱讀 `.agent/skills/deep-expansion/SKILL.md`，了解深度擴充的具體要求。
+**必須依序讀取以下文件：**
+
+1. `.agent/skills/deep-expansion/SKILL.md` - 品質標準（行數、結構、禁止事項）
+2. `.agent/prompts/rebuild-content.md` - 各章節的**具體內容要求**（非常重要！）
+
+> [!IMPORTANT]
+> `rebuild-content.md` 包含每個章節應該涵蓋的具體技術點，例如：
+> - 02_C語言 要涵蓋：Pointer to Pointer, Function Pointer, volatile, Inline vs Macro...
+> - 03_底層驅動 要涵蓋：Linux Device Model, Platform Driver, probe timing, devm_ API...
+> 
+> 如果不讀取這份文件，你只會知道「要寫多深」，但不知道「具體要寫什麼」。
 
 ---
 
@@ -21,7 +31,7 @@ description: 重新打造 NextJob 外商韌體面試聖經 (觸發完整內容�
 // turbo-all
 
 ### 2.1 擴充 02_C語言/
-擴充此目錄下所有 `.md` 檔案，遵守 Skill 中的深度標準。
+擴充此目錄下所有 `.md` 檔案，遵守 Skill 和 rebuild-content.md 中的標準。
 完成後：
 ```bash
 git add . && git commit -m "docs(02_C語言): 深度擴充完成"
@@ -62,5 +72,6 @@ git add . && git commit -m "docs: 完成面試聖經 v2.0 全面升級"
 ## 注意事項
 
 - **每個檔案完成後暫停**，等待使用者說「繼續」
-- **品質下降時**：重新閱讀 `.agent/skills/deep-expansion/SKILL.md`
+- **品質下降時**：重新閱讀 Skill 和 rebuild-content.md
 - **遵守 AGENT.md**：繁體中文、Conventional Commits
+- **避免 Token Limit**：每次只處理一個檔案，完成後暫停
