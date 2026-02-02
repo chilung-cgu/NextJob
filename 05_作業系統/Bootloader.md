@@ -504,3 +504,658 @@ bootcmd=sf probe; sf read 0x80000000 0x100000 0x500000; bootm 0x80000000
 - 擴充前行數：318 行
 - 擴充後行數：約 500 行
 - 涵蓋：ARM vs x86 Boot 流程、ATF/TF-A、Exception Levels、Secure Boot Chain of Trust、U-Boot DM、FIT Image
+
+---
+
+## 🔷 第七部分：U-Boot SPL 詳解
+
+### 7.1 SPL 是什麼？
+
+```
+SPL (Secondary Program Loader) / MLO (X-Loader)
+
+為什麼需要 SPL？
+━━━━━━━━━━━━━━━━
+系統剛上電時，只有 SRAM 可用（幾十 KB），DRAM 還沒初始化。
+完整的 U-Boot (~500KB+) 無法放入 SRAM。
+
+解決方案：
+1. Boot ROM 載入一個小的 SPL 到 SRAM
+2. SPL 初始化 DRAM
+3. SPL 載入完整 U-Boot 到 DRAM
+4. 跳轉到 U-Boot
+
+┌──────────────────────────────────────────────────────────────┐
+│                   SPL 執行環境                               │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  記憶體佈局（典型 AST2600）：                                  │
+│                                                              │
+│  0x00000000  ┌────────────────────┐                         │
+│              │  Boot ROM (內建)    │ 64KB                   │
+│  0x00010000  ├────────────────────┤                         │
+│              │  SRAM              │ 64KB                    │
+│              │  ┌──────────────┐  │                         │
+│              │  │ SPL Code     │  │ ~32KB                   │
+│              │  │ SPL Stack    │  │                         │
+│              │  │ SPL BSS      │  │                         │
+│              │  └──────────────┘  │                         │
+│  0x00020000  └────────────────────┘                         │
+│                                                              │
+│  DRAM 初始化後：                                              │
+│  0x80000000  ┌────────────────────┐                         │
+│              │  U-Boot (完整)     │ ~1MB                    │
+│              ├────────────────────┤                         │
+│              │  Kernel           │                          │
+│              ├────────────────────┤                         │
+│              │  DTB / FIT Image  │                          │
+│              └────────────────────┘                         │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 SPL 程式碼結構
+
+```c
+/* arch/arm/lib/crt0_aarch64.S */
+/* SPL 的 Entry Point */
+
+ENTRY(_start)
+    /* 1. 設定 Stack Pointer */
+    ldr     x0, =CONFIG_SPL_STACK
+    bic     sp, x0, #0xf        /* 16-byte aligned */
+    
+    /* 2. 清除 BSS */
+    ldr     x0, =__bss_start
+    ldr     x1, =__bss_end
+clear_bss:
+    cmp     x0, x1
+    b.hs    clear_done
+    str     xzr, [x0], #8
+    b       clear_bss
+clear_done:
+    
+    /* 3. 跳轉到 C 程式碼 */
+    bl      board_init_f        /* 早期初始化 */
+    bl      board_init_r        /* 後期初始化 */
+ENDPROC(_start)
+```
+
+```c
+/* common/spl/spl.c */
+/* SPL 的 C 入口 */
+
+void board_init_f(ulong dummy)
+{
+    /* 早期硬體初始化 */
+    
+    /* 1. Timer 初始化 */
+    timer_init();
+    
+    /* 2. UART 初始化（用於 debug） */
+    preloader_console_init();
+    
+    /* 3. 讀取 Boot Mode（從哪開機：SPI/eMMC/UART）*/
+    u32 boot_mode = get_boot_device();
+    
+    /* 4. DRAM 初始化（最關鍵！）*/
+    gd->ram_size = initdram(0);
+    if (gd->ram_size == 0)
+        hang();
+    
+    printf("DRAM: %llu MiB\n", gd->ram_size >> 20);
+}
+
+void board_init_r(gd_t *dummy1, ulong dummy2)
+{
+    /* DRAM 已可用 */
+    
+    /* 1. 重新設定 Stack 到 DRAM */
+    
+    /* 2. 載入 U-Boot 到 DRAM */
+    struct spl_image_info spl_image;
+    spl_load_image(&spl_image);
+    
+    /* 3. 驗證簽章（如有 Secure Boot）*/
+#ifdef CONFIG_SPL_FIT_SIGNATURE
+    if (!fit_image_verify(&spl_image))
+        hang();
+#endif
+    
+    /* 4. 跳轉到 U-Boot */
+    jump_to_image_no_args(&spl_image);
+    /* 永不返回 */
+}
+```
+
+### 7.3 DRAM 初始化
+
+```c
+/* board/aspeed/ast2600/dram.c (簡化) */
+
+int initdram(void)
+{
+    struct ast2600_sdram_regs *regs = 
+        (void *)AST2600_SDRAM_BASE;
+    
+    /* 1. 設定 SDRAM Controller */
+    writel(CONFIG_DRAM_TIMINGS, &regs->cfg);
+    
+    /* 2. 發送初始化命令 */
+    writel(SDRAM_CMD_PALL, &regs->cmd);  /* Precharge All */
+    writel(SDRAM_CMD_MRS, &regs->cmd);   /* Mode Register Set */
+    writel(SDRAM_CMD_REF, &regs->cmd);   /* Refresh */
+    writel(SDRAM_CMD_REF, &regs->cmd);   /* Refresh */
+    
+    /* 3. 啟用自動刷新 */
+    writel(AUTO_REFRESH_ENABLE, &regs->refresh);
+    
+    /* 4. 回傳 DRAM 大小 */
+    return CONFIG_SYS_SDRAM_SIZE;
+}
+```
+
+---
+
+## 🔷 第八部分：U-Boot Linker Script
+
+### 8.1 Linker Script 基礎
+
+```ld
+/* u-boot.lds (簡化版) */
+
+OUTPUT_FORMAT("elf64-littleaarch64")
+OUTPUT_ARCH(aarch64)
+ENTRY(_start)
+
+MEMORY
+{
+    /* SRAM for SPL */
+    SRAM (rwx) : ORIGIN = 0x00010000, LENGTH = 64K
+    
+    /* DRAM for U-Boot */
+    DRAM (rwx) : ORIGIN = 0x80000000, LENGTH = 512M
+}
+
+SECTIONS
+{
+    /* 程式碼段 */
+    . = CONFIG_SYS_TEXT_BASE;  /* U-Boot 載入位址 */
+    
+    .text : {
+        __text_start = .;
+        arch/arm/cpu/armv8/start.o (.text*)  /* Entry Point 放最前 */
+        *(.text*)
+        __text_end = .;
+    }
+    
+    /* 唯讀資料 */
+    .rodata : {
+        *(.rodata*)
+    }
+    
+    /* 可寫資料（有初始值）*/
+    .data : {
+        __data_start = .;
+        *(.data*)
+        __data_end = .;
+    }
+    
+    /* BSS（未初始化資料，載入時清零）*/
+    .bss (NOLOAD) : {
+        __bss_start = .;
+        *(.bss*)
+        *(COMMON)
+        __bss_end = .;
+    }
+    
+    /* U-Boot 需要的特殊段 */
+    .u_boot_list : {
+        KEEP(*(SORT(.u_boot_list*)));  /* 命令、驅動註冊 */
+    }
+    
+    _end = .;
+}
+```
+
+### 8.2 重要的 Section 解釋
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│              U-Boot 常見 Section                             │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  .text     - 程式碼                                          │
+│  .rodata   - 唯讀資料（字串常數等）                           │
+│  .data     - 有初始值的全域變數                               │
+│  .bss      - 未初始化的全域變數（清零）                        │
+│                                                              │
+│  .u_boot_list - U-Boot 特有：                                 │
+│    - 命令表 (U_BOOT_CMD)                                     │
+│    - 驅動表 (U_BOOT_DRIVER)                                  │
+│    - 環境變數預設值                                           │
+│                                                              │
+│  .rel.dyn  - 位址無關碼的重定位資訊 (PIC)                     │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🔷 第九部分：Kernel 載入與啟動
+
+### 9.1 U-Boot 載入 Kernel 的過程
+
+```c
+/* 以 bootm 命令為例 */
+
+int do_bootm(cmd_tbl_t *cmdtp, int flag, int argc, char *const argv[])
+{
+    /* 1. 解析 Image Header */
+    struct bootm_headers images;
+    bootm_find_other(cmdtp, flag, argc, argv, &images);
+    
+    /* 2. 驗證 Image */
+    if (images.verify) {
+        if (!image_verify(images.os.image_start, images.os.image_len))
+            return -1;
+    }
+    
+    /* 3. 解壓縮（如需要）*/
+    if (images.os.comp != IH_COMP_NONE) {
+        decompress(images.os.load, ..., images.os.comp);
+    }
+    
+    /* 4. 載入 DTB */
+    ftaddr = map_fdt_blob(images.ft_addr);
+    set_bootargs(ftaddr);
+    
+    /* 5. 跳轉到 Kernel */
+    boot_jump_linux(&images, flag);
+    /* 永不返回 */
+}
+```
+
+### 9.2 跳轉到 Linux Kernel
+
+```c
+/* arch/arm/lib/bootm.c */
+
+void boot_jump_linux(bootm_headers_t *images, int flag)
+{
+    unsigned long machid = gd->bd->bi_arch_number;
+    char *s;
+    void (*kernel_entry)(int, int, uint);
+    
+    kernel_entry = (void *)images->ep;  /* Entry Point */
+    
+    /* ARM Linux 啟動約定：
+     * r0 = 0
+     * r1 = Machine Type ID
+     * r2 = DTB 位址
+     */
+    
+    /* 關閉 Cache 和 MMU */
+    cleanup_before_linux();
+    
+    /* 跳轉！ */
+    kernel_entry(0, machid, (unsigned long)images->ft_addr);
+}
+
+void cleanup_before_linux(void)
+{
+    /* 1. 關閉中斷 */
+    disable_interrupts();
+    
+    /* 2. Flush D-Cache */
+    flush_dcache_all();
+    
+    /* 3. 關閉 D-Cache */
+    dcache_disable();
+    
+    /* 4. 關閉 I-Cache */
+    icache_disable();
+    
+    /* 5. 關閉 MMU（如果有開啟）*/
+    mmu_disable();
+}
+```
+
+### 9.3 ARM64 Kernel Entry Point
+
+```c
+/* Linux Kernel: arch/arm64/kernel/head.S */
+
+/*
+ * ARM64 Linux 啟動要求：
+ * - x0 = DTB 的實體位址
+ * - CPU 必須在 EL2 或 EL1
+ * - MMU 關閉
+ * - D-cache 關閉
+ * - Primary CPU 呼叫，Secondary CPU 等待
+ */
+
+ENTRY(_text)
+    /*
+     * 跳過 Image header
+     * Linux ARM64 Image 開頭有 64-byte header
+     */
+    b       primary_entry
+    .quad   0                       /* Image load offset */
+    .quad   _kernel_size_le         /* Image size */
+    .quad   _kernel_flags_le        /* Flags */
+    /* ... */
+
+primary_entry:
+    /* 保存 DTB 位址 */
+    mov     x21, x0
+    
+    /* 必要的 CPU 設定 */
+    bl      el2_setup               /* 設定 EL2 → EL1 */
+    
+    /* 建立初始 Page Table */
+    adrp    x0, init_pg_dir
+    bl      __create_page_tables
+    
+    /* 開啟 MMU */
+    bl      __enable_mmu
+    
+    /* 跳轉到 start_kernel */
+    ldr     x8, =__primary_switched
+    br      x8
+```
+
+---
+
+## 🔷 第十部分：BMC 特有的開機場景
+
+### 10.1 AST2600 Boot ROM 流程
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                AST2600 Boot ROM 流程                         │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  1. Power On Reset                                           │
+│     └─► Boot ROM 開始執行 (位於 SoC 內部)                     │
+│                                                              │
+│  2. 讀取 Boot Strap Pins / OTP                               │
+│     ├─► 決定 Boot Source: SPI/eMMC/UART                      │
+│     └─► 讀取 Secure Boot 設定                                │
+│                                                              │
+│  3. 初始化 Boot Device                                        │
+│     └─► SPI Flash Controller / eMMC Controller               │
+│                                                              │
+│  4. 載入 SPL                                                  │
+│     ├─► 讀取 SPL Image Header                                │
+│     ├─► 驗證簽章 (如有 Secure Boot)                          │
+│     └─► 複製 SPL 到 SRAM                                     │
+│                                                              │
+│  5. 跳轉到 SPL                                                │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 10.2 OpenBMC 開機完整流程
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│              OpenBMC 完整開機流程                             │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  硬體層：                                                     │
+│  ┌──────────────────────────────────────────┐                │
+│  │ Boot ROM → SPL → U-Boot → Kernel        │                │
+│  └──────────────────────────────────────────┘                │
+│                                                              │
+│  U-Boot 環境變數 (典型)：                                      │
+│  ─────────────────────────                                   │
+│  bootcmd=bootm 0x20080000                                    │
+│  bootargs=console=ttyS4,115200n8 root=/dev/ram rw            │
+│                                                              │
+│  Kernel 啟動：                                                │
+│  ─────────────                                               │
+│  1. 解壓縮 initramfs                                          │
+│  2. 執行 /init (busybox)                                     │
+│  3. 掛載 rootfs (squashfs from FIT)                          │
+│  4. switch_root 到真正的 rootfs                              │
+│                                                              │
+│  Systemd 啟動：                                               │
+│  ─────────────                                               │
+│  1. basic.target (基礎服務)                                   │
+│  2. multi-user.target (BMC 服務)                             │
+│     ├─► phosphor-xxx 服務群                                  │
+│     ├─► ipmid / bmcweb                                       │
+│     └─► 硬體監控 daemon                                       │
+│                                                              │
+│  典型開機時間：                                                │
+│  Boot ROM → SPL:     ~100ms                                  │
+│  SPL → U-Boot:       ~500ms                                  │
+│  U-Boot → Kernel:    ~2s                                     │
+│  Kernel → Services:  ~30s                                    │
+│  Total:              ~35s                                    │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📝 更多面試題
+
+### Q6: 解釋 U-Boot 的 board_init_f 和 board_init_r
+
+**難度**：⭐⭐⭐⭐⭐
+**常見於**：NVIDIA / AMD
+
+**問題**：
+U-Boot 中的 board_init_f() 和 board_init_r() 有什麼區別？
+
+**標準答案**：
+
+**board_init_f (f = First)**：
+- 在 DRAM 初始化**之前**執行
+- 只能使用 SRAM 和 CPU 暫存器
+- 不能使用 BSS（需要清零但可能沒空間）
+- 使用 GD（Global Data）存放在 Stack
+- 典型工作：Timer、UART、DRAM 初始化
+
+**board_init_r (r = Relocated)**：
+- 在 DRAM 初始化**之後**執行
+- 完整記憶體可用
+- BSS 已清零
+- 可以使用 malloc()
+- 典型工作：載入 Kernel、網路、Flash
+
+```c
+void board_init_f(ulong boot_flags)
+{
+    gd->flags = boot_flags;
+    timer_init();
+    serial_init();
+    dram_init();  /* 關鍵！ */
+    /* 這之後 DRAM 可用 */
+}
+
+void board_init_r(gd_t *new_gd, ulong dest_addr)
+{
+    /* 已在 DRAM 執行 */
+    flash_init();
+    env_init();
+    eth_init();
+    /* ... */
+    main_loop();  /* 命令行或自動開機 */
+}
+```
+
+---
+
+### Q7: 什麼是 U-Boot Relocation？
+
+**難度**：⭐⭐⭐⭐⭐
+
+**問題**：
+U-Boot 為什麼需要 Relocation？如何實現？
+
+**標準答案**：
+
+**為什麼需要**：
+- U-Boot 最初被載入到某個位址（CONFIG_SYS_TEXT_BASE）
+- 但這個位址可能不適合：
+  - Kernel 需要在低位址
+  - 需要連續記憶體給 Kernel
+- 所以 U-Boot 會把自己搬到 DRAM 頂端
+
+**Relocation 過程**：
+1. 計算新位址（DRAM 頂端減去 U-Boot 大小）
+2. 複製程式碼到新位址
+3. 修正所有需要重定位的位址（.rel.dyn section）
+4. 跳轉到新位址繼續執行
+
+```c
+/* 重定位偏移量 */
+gd->reloc_off = new_addr - CONFIG_SYS_TEXT_BASE;
+
+/* 修正指標 */
+for (ptr = __rel_dyn_start; ptr < __rel_dyn_end; ptr++) {
+    *ptr += gd->reloc_off;
+}
+```
+
+---
+
+### Q8: Linux Kernel 啟動時對 U-Boot 的要求？
+
+**難度**：⭐⭐⭐⭐
+
+**問題**：
+U-Boot 跳轉到 Linux Kernel 前，必須滿足哪些條件？
+
+**標準答案**：
+
+**ARM64 (AArch64)**：
+```
+x0 = DTB 的實體位址
+x1-x3 = 保留（設為 0）
+
+CPU 狀態要求：
+- 必須在 EL2 或 EL1（不能在 EL3）
+- MMU 關閉
+- D-cache 關閉（或乾淨）
+- I-cache 可開可關
+- 中斷禁用
+- Primary CPU 呼叫，其他 CPU 在 WFI
+```
+
+**ARM32**：
+```
+r0 = 0
+r1 = Machine Type ID
+r2 = DTB 的實體位址（或 ATAGS）
+
+MMU 關閉，Cache 關閉，中斷禁用
+```
+
+**準備工作**：
+```c
+void cleanup_before_linux(void)
+{
+    disable_interrupts();
+    flush_dcache_all();
+    dcache_disable();
+    icache_disable();
+    mmu_disable();
+}
+```
+
+---
+
+### Q9: 什麼是 ATF 的 PSCI？
+
+**難度**：⭐⭐⭐⭐⭐
+**常見於**：ARM 相關職位
+
+**問題**：
+解釋 PSCI 的作用和常見用途。
+
+**標準答案**：
+
+**PSCI (Power State Coordination Interface)**：
+- ARM 定義的電源管理標準介面
+- 通過 SMC (Secure Monitor Call) 呼叫
+- 由 ATF BL31 實作
+
+**常見 PSCI 功能**：
+| 功能 | 說明 |
+|:---|:---|
+| CPU_ON | 啟動一個 Secondary CPU |
+| CPU_OFF | 關閉當前 CPU |
+| CPU_SUSPEND | 進入低功耗狀態 |
+| SYSTEM_RESET | 重啟系統 |
+| SYSTEM_OFF | 關閉系統 |
+
+**Linux 使用 PSCI**：
+```c
+/* arch/arm64/kernel/psci.c */
+static int psci_cpu_on(unsigned long cpuid, unsigned long entry)
+{
+    return invoke_psci_fn(PSCI_0_2_FN64_CPU_ON,
+                          cpuid, entry, 0);
+}
+```
+
+---
+
+### Q10: 如何 Debug 開機問題？
+
+**難度**：⭐⭐⭐⭐
+
+**問題**：
+系統開不了機，如何診斷問題在哪個階段？
+
+**標準答案**：
+
+**Debug 方法（由易到難）**：
+
+1. **UART Log**：最基本
+```
+# 確認 UART 有輸出
+# 看最後一行停在哪
+U-Boot SPL 2023.01 (...)
+Trying to boot from SPI
+<停在這裡> → SPL 問題
+```
+
+2. **GPIO Beep Code**：沒有 UART 輸出時
+```c
+/* 用 GPIO LED 或蜂鳴器指示進度 */
+void debug_beep(int code) {
+    for (int i = 0; i < code; i++) {
+        gpio_set_value(DEBUG_LED, 1);
+        udelay(100000);
+        gpio_set_value(DEBUG_LED, 0);
+        udelay(100000);
+    }
+}
+```
+
+3. **JTAG/SWD**：硬體除錯
+   - 可以單步執行
+   - 查看暫存器
+   - 需要專用硬體
+
+4. **常見問題檢查**：
+   - DRAM 初始化失敗 → SPL 停止
+   - 簽章驗證失敗 → Secure Boot 拒絕
+   - Image 損壞 → CRC 錯誤
+   - 錯誤的 bootargs → Kernel panic
+
+---
+
+## 📚 延伸閱讀
+
+1. **U-Boot 官方文件**：https://u-boot.readthedocs.io/
+2. **ARM Trusted Firmware**：https://trustedfirmware-a.readthedocs.io/
+3. **Linux Kernel Documentation**：Documentation/arm64/booting.rst
+4. **Bootlin 教材**：https://bootlin.com/doc/training/embedded-linux/
+5. **LWN.net**：Boot-related articles
+
