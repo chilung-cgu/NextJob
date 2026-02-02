@@ -905,10 +905,652 @@ consumer:
 
 ---
 
+## 🔷 第八部分：System Call 完整流程
+
+### 8.1 什麼是 System Call？
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                System Call 概念                               │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  User Space 程式無法直接存取硬體或 Kernel 資料                │
+│  → 透過 System Call 向 Kernel 請求服務                       │
+│                                                              │
+│  ┌───────────────┐      svc #0      ┌───────────────┐       │
+│  │  User Space   │ ───────────────► │ Kernel Space  │       │
+│  │  (EL0)        │                  │ (EL1)         │       │
+│  │               │ ◄─────────────── │               │       │
+│  │  Application  │      eret        │  sys_xxx()    │       │
+│  └───────────────┘                  └───────────────┘       │
+│                                                              │
+│  常見 System Call：                                           │
+│  - 檔案操作：open, read, write, close                        │
+│  - Process 管理：fork, exec, exit, wait                      │
+│  - 記憶體管理：mmap, brk, mprotect                            │
+│  - 網路：socket, connect, send, recv                         │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 8.2 ARM64 System Call 執行流程
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│           ARM64 System Call 完整流程                          │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  1. User Space 準備                                           │
+│     ├─► 將 syscall number 放入 x8                            │
+│     ├─► 將參數放入 x0-x5 (最多 6 個參數)                      │
+│     └─► 執行 svc #0 指令                                     │
+│                                                              │
+│  2. 硬體處理 (CPU)                                            │
+│     ├─► 切換到 EL1 (Exception Level 1)                       │
+│     ├─► 保存 PC 到 ELR_EL1                                   │
+│     ├─► 保存 PSTATE 到 SPSR_EL1                              │
+│     └─► 跳轉到 Exception Vector (VBAR_EL1 + offset)          │
+│                                                              │
+│  3. Kernel Entry (entry.S)                                    │
+│     ├─► el0_sync (同步異常入口)                               │
+│     ├─► kernel_entry 0 (保存所有暫存器到 pt_regs)            │
+│     ├─► 判斷 ESR_EL1 確認是 SVC                               │
+│     └─► 呼叫 el0_svc()                                       │
+│                                                              │
+│  4. System Call 分發                                          │
+│     ├─► 從 x8 讀取 syscall number                            │
+│     ├─► 查表 sys_call_table[nr]                              │
+│     └─► 呼叫對應的 sys_xxx() 函式                            │
+│                                                              │
+│  5. Kernel Exit                                               │
+│     ├─► 將返回值放入 x0                                       │
+│     ├─► ret_to_user (恢復 pt_regs)                           │
+│     └─► eret (返回 EL0)                                      │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 8.3 ARM64 Entry Code 詳解
+
+```c
+/* arch/arm64/kernel/entry.S (簡化版) */
+
+/*
+ * Exception Vector Table
+ * 位於 VBAR_EL1 指向的位址
+ */
+    .align  11
+ENTRY(vectors)
+    /* Current EL with SP0 */
+    ventry  el1_sync_invalid
+    ventry  el1_irq_invalid
+    ventry  el1_fiq_invalid
+    ventry  el1_error_invalid
+
+    /* Current EL with SPx */
+    ventry  el1_sync         /* Kernel 自己的 synchronous exception */
+    ventry  el1_irq          /* Kernel 的 IRQ */
+    ventry  el1_fiq_invalid
+    ventry  el1_error_invalid
+
+    /* Lower EL using AArch64 (User Space 64-bit) */
+    ventry  el0_sync         /* ← User Space syscall 進入這裡！ */
+    ventry  el0_irq
+    ventry  el0_fiq_invalid
+    ventry  el0_error_invalid
+
+    /* Lower EL using AArch32 (User Space 32-bit) */
+    ventry  el0_sync_compat
+    ventry  el0_irq_compat
+    ...
+END(vectors)
+
+/*
+ * el0_sync - 處理來自 EL0 的同步異常
+ */
+el0_sync:
+    kernel_entry 0          /* 保存 User Context 到 pt_regs */
+    
+    mrs     x25, esr_el1    /* 讀取 Exception Syndrome Register */
+    lsr     x24, x25, #ESR_ELx_EC_SHIFT  /* 取得 Exception Class */
+    
+    cmp     x24, #ESR_ELx_EC_SVC64  /* 是 SVC (System Call) 嗎？ */
+    b.eq    el0_svc         /* 是，跳到 syscall 處理 */
+    
+    cmp     x24, #ESR_ELx_EC_DABT_LOW  /* Data Abort？ */
+    b.eq    el0_da          /* Page Fault */
+    
+    /* 其他異常類型... */
+    b       el0_inv
+
+/*
+ * el0_svc - System Call 處理
+ */
+el0_svc:
+    /* 關閉 Interrupt，進入臨界區 */
+    msr     daifclr, #(8 | 4 | 1)  /* Enable D, A, I */
+    
+    /* 呼叫 C 函式 */
+    bl      el0_svc_handler
+    
+    /* 返回 User Space */
+    b       ret_to_user
+```
+
+### 8.4 System Call Handler
+
+```c
+/* arch/arm64/kernel/syscall.c */
+
+void el0_svc_handler(struct pt_regs *regs)
+{
+    unsigned long scno = regs->regs[8];  /* x8 = syscall number */
+    
+    /* 1. 追蹤 (如果有開啟 syscall tracing) */
+    if (unlikely(test_thread_flag(TIF_SYSCALL_TRACE)))
+        scno = syscall_trace_enter(regs);
+    
+    /* 2. 檢查 syscall number 是否有效 */
+    if (scno < NR_syscalls) {
+        /* 3. 呼叫對應的 syscall handler */
+        regs->regs[0] = invoke_syscall(regs, scno);
+    } else {
+        regs->regs[0] = -ENOSYS;  /* 無效的 syscall */
+    }
+    
+    /* 4. 追蹤返回 */
+    syscall_trace_exit(regs);
+}
+
+static long invoke_syscall(struct pt_regs *regs, unsigned int scno)
+{
+    syscall_fn_t syscall_fn;
+    
+    /* 查表取得函式指標 */
+    syscall_fn = sys_call_table[scno];
+    
+    /* 呼叫 syscall，參數從 x0-x5 傳入 */
+    return syscall_fn(
+        regs->regs[0],  /* arg1 */
+        regs->regs[1],  /* arg2 */
+        regs->regs[2],  /* arg3 */
+        regs->regs[3],  /* arg4 */
+        regs->regs[4],  /* arg5 */
+        regs->regs[5]   /* arg6 */
+    );
+}
+```
+
+### 8.5 System Call Table
+
+```c
+/* arch/arm64/kernel/sys.c */
+
+/* Syscall 函式宣告 */
+#define __SYSCALL(nr, sym)  asmlinkage long __arm64_##sym(const struct pt_regs *);
+#include <asm/unistd.h>
+
+#undef __SYSCALL
+#define __SYSCALL(nr, sym)  [nr] = __arm64_##sym,
+
+/* 建立 syscall table */
+const syscall_fn_t sys_call_table[__NR_syscalls] = {
+    [0 ... __NR_syscalls - 1] = __arm64_sys_ni_syscall,  /* 預設：未實作 */
+#include <asm/unistd.h>  /* 展開所有 syscall */
+};
+
+/* 範例 syscall 定義 */
+/* include/uapi/asm-generic/unistd.h */
+#define __NR_read 63
+#define __NR_write 64
+#define __NR_openat 56
+#define __NR_close 57
+/* ... */
+```
+
+### 8.6 從 User Space 到 Kernel 的完整範例
+
+```c
+/* User Space: 呼叫 write() */
+
+#include <unistd.h>
+
+int main() {
+    write(1, "Hello\n", 6);  /* stdout, 字串, 長度 */
+    return 0;
+}
+
+/* 編譯後的組語 (glibc wrapper) */
+/*
+    mov     x0, #1          ; fd = 1 (stdout)
+    adr     x1, message     ; buf = "Hello\n"
+    mov     x2, #6          ; count = 6
+    mov     x8, #64         ; syscall number = __NR_write
+    svc     #0              ; 觸發 syscall
+    ; 返回後 x0 = 寫入的 byte 數
+*/
+```
+
+```c
+/* Kernel Space: sys_write 處理 */
+
+/* fs/read_write.c */
+SYSCALL_DEFINE3(write, unsigned int, fd, const char __user *, buf,
+                size_t, count)
+{
+    struct fd f = fdget_pos(fd);
+    ssize_t ret = -EBADF;
+    
+    if (!f.file)
+        return -EBADF;
+    
+    /* 權限檢查 */
+    if (!(f.file->f_mode & FMODE_WRITE))
+        goto out;
+    
+    /* 呼叫 VFS 層 */
+    ret = vfs_write(f.file, buf, count, &pos);
+    
+out:
+    fdput_pos(f);
+    return ret;
+}
+```
+
+### 8.7 vDSO (Virtual Dynamic Shared Object)
+
+```c
+/*
+ * vDSO：不需要真正進入 Kernel 的 "快速 syscall"
+ * 
+ * 常見 vDSO 函式：
+ * - gettimeofday()
+ * - clock_gettime()
+ * - getcpu()
+ * 
+ * 原理：
+ * - Kernel 將唯讀資料 (如時間) 映射到 User Space
+ * - User Space 直接讀取，不需要 mode switch
+ * - 速度提升 10x+
+ */
+
+/* User Space 呼叫 clock_gettime() */
+#include <time.h>
+struct timespec ts;
+clock_gettime(CLOCK_MONOTONIC, &ts);
+/* 實際上沒有進入 Kernel！直接從 vDSO 頁面讀取 */
+
+/* vDSO 記憶體映射 */
+/*
+ * 0x00007ffff7ffd000  vdso (由 Kernel 自動映射)
+ *    ├── __vdso_clock_gettime
+ *    ├── __vdso_gettimeofday
+ *    └── __vdso_getcpu
+ */
+```
+
+---
+
+## 🔷 第九部分：Kernel Module
+
+### 9.1 什麼是 Kernel Module？
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                Kernel Module 概念                             │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Kernel Module = 可動態載入/卸載的 Kernel 程式碼              │
+│                                                              │
+│  優點：                                                       │
+│  ✓ 不需重新編譯整個 Kernel                                    │
+│  ✓ 節省記憶體（只載入需要的模組）                              │
+│  ✓ 方便開發和除錯                                             │
+│                                                              │
+│  缺點：                                                       │
+│  ✗ 每個模組都有額外開銷                                       │
+│  ✗ 模組間介面需要穩定                                         │
+│  ✗ 安全風險（可載入惡意模組）                                  │
+│                                                              │
+│  常見用途：                                                   │
+│  - 裝置驅動 (Device Drivers)                                 │
+│  - 檔案系統 (ext4, btrfs)                                    │
+│  - 網路協定 (IPv6, netfilter)                                │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 最簡單的 Kernel Module
+
+```c
+/* hello.c - 最簡單的 Kernel Module */
+
+#include <linux/module.h>    /* 所有模組都需要 */
+#include <linux/kernel.h>    /* printk() */
+#include <linux/init.h>      /* __init, __exit */
+
+/* 模組元資料 */
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Your Name");
+MODULE_DESCRIPTION("A simple hello world module");
+MODULE_VERSION("1.0");
+
+/* 模組載入時執行 */
+static int __init hello_init(void)
+{
+    printk(KERN_INFO "Hello, Kernel World!\n");
+    return 0;  /* 0 = 成功，非零 = 失敗 */
+}
+
+/* 模組卸載時執行 */
+static void __exit hello_exit(void)
+{
+    printk(KERN_INFO "Goodbye, Kernel World!\n");
+}
+
+/* 註冊 init 和 exit 函式 */
+module_init(hello_init);
+module_exit(hello_exit);
+```
+
+### 9.3 Makefile for Kernel Module
+
+```makefile
+# Makefile
+
+obj-m := hello.o
+
+# 如果是多檔案模組
+# hello-objs := file1.o file2.o
+
+KDIR := /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+# 使用方式：
+# $ make
+# $ sudo insmod hello.ko
+# $ dmesg | tail
+# $ sudo rmmod hello
+```
+
+### 9.4 模組參數
+
+```c
+/* 模組參數允許載入時傳入設定 */
+
+#include <linux/moduleparam.h>
+
+/* 定義參數 */
+static int debug_level = 0;
+static char *device_name = "mydev";
+
+/* 註冊參數 */
+module_param(debug_level, int, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(debug_level, "Debug level (0-3)");
+
+module_param(device_name, charp, S_IRUGO);
+MODULE_PARM_DESC(device_name, "Device name");
+
+/* 使用方式：
+ * $ sudo insmod mymodule.ko debug_level=2 device_name="dev0"
+ * 
+ * 查看參數：
+ * $ cat /sys/module/mymodule/parameters/debug_level
+ */
+```
+
+### 9.5 Symbol Export (符號導出)
+
+```c
+/*
+ * 模組間共享函式和變數
+ */
+
+/* 模組 A：導出符號 */
+int my_shared_function(int arg)
+{
+    return arg * 2;
+}
+EXPORT_SYMBOL(my_shared_function);      /* 所有模組可見 */
+/* 或 EXPORT_SYMBOL_GPL(my_shared_function); 只對 GPL 模組可見 */
+
+/* 模組 B：使用模組 A 的函式 */
+extern int my_shared_function(int arg);
+
+static int __init moduleB_init(void)
+{
+    int result = my_shared_function(21);
+    printk("Result: %d\n", result);
+    return 0;
+}
+
+/* 載入順序很重要！
+ * 1. 先載入模組 A
+ * 2. 再載入模組 B
+ * 
+ * 否則模組 B 會因為找不到符號而載入失敗
+ */
+```
+
+### 9.6 Module 載入流程
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│              insmod / modprobe 載入流程                       │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  1. User Space: insmod hello.ko                               │
+│     └─► 呼叫 init_module() syscall                           │
+│                                                              │
+│  2. Kernel: load_module()                                     │
+│     ├─► 驗證 ELF 格式                                         │
+│     ├─► 分配 Kernel 記憶體                                    │
+│     ├─► 複製模組程式碼和資料                                  │
+│     ├─► 解析符號 (Relocation)                                │
+│     ├─► 處理模組依賴                                          │
+│     └─► 呼叫 module->init() (你的 init 函式)                  │
+│                                                              │
+│  3. 模組現在是 Kernel 的一部分！                               │
+│                                                              │
+│  insmod vs modprobe：                                         │
+│  - insmod: 只載入指定模組，不處理依賴                         │
+│  - modprobe: 自動處理模組依賴 (從 /lib/modules/)              │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 9.7 devm_ API (Device Managed Resources)
+
+```c
+/*
+ * devm_* API：Driver 開發中非常重要！
+ * 
+ * 自動在 Driver 卸載時釋放資源，避免記憶體洩漏
+ */
+
+/* 傳統做法：手動管理 */
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_data *data;
+    int ret;
+    
+    data = kmalloc(sizeof(*data), GFP_KERNEL);
+    if (!data)
+        return -ENOMEM;
+    
+    ret = request_irq(irq, handler, 0, "mydev", data);
+    if (ret) {
+        kfree(data);  /* 必須手動釋放！容易忘記 */
+        return ret;
+    }
+    
+    /* ... */
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    free_irq(irq, data);  /* 必須手動釋放 */
+    kfree(data);          /* 必須手動釋放 */
+    return 0;
+}
+
+/* 使用 devm_：自動管理 */
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_data *data;
+    int ret;
+    
+    /* devm_kzalloc：當 device 移除時自動釋放 */
+    data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
+    if (!data)
+        return -ENOMEM;
+    
+    /* devm_request_irq：當 device 移除時自動 free_irq */
+    ret = devm_request_irq(&pdev->dev, irq, handler, 0, "mydev", data);
+    if (ret)
+        return ret;  /* 不需要手動釋放 data！ */
+    
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    /* 什麼都不需要做！devm_ 自動處理 */
+    return 0;
+}
+```
+
+### 9.8 常見 devm_ API
+
+| API | 功能 |
+|:---|:---|
+| `devm_kzalloc()` | 配置並清零記憶體 |
+| `devm_kmalloc()` | 配置記憶體 |
+| `devm_request_irq()` | 註冊中斷 |
+| `devm_ioremap()` | 映射 I/O 記憶體 |
+| `devm_clk_get()` | 取得 clock |
+| `devm_gpio_request()` | 請求 GPIO |
+| `devm_regulator_get()` | 取得 regulator |
+| `devm_pinctrl_get()` | 取得 pinctrl |
+
+---
+
+## 📝 更多面試題
+
+### Q11: 解釋 ARM64 System Call 的完整流程
+
+**難度**：⭐⭐⭐⭐⭐
+**常見於**：ARM 相關職位 / NVIDIA
+
+**問題**：
+描述當 User Space 呼叫 write() 時，從 User Space 到 Kernel 再返回的完整流程。
+
+**標準答案**：
+
+1. **User Space 準備**：
+   - x0-x5 = 參數 (fd, buf, count, ...)
+   - x8 = syscall number (__NR_write = 64)
+   - 執行 `svc #0`
+
+2. **CPU 硬體處理**：
+   - 切換到 EL1
+   - 保存 PC 到 ELR_EL1，PSTATE 到 SPSR_EL1
+   - 跳轉到 Exception Vector (el0_sync)
+
+3. **Kernel Entry (entry.S)**：
+   - `kernel_entry 0` 保存所有暫存器到 pt_regs
+   - 讀取 ESR_EL1 判斷是 SVC
+   - 呼叫 `el0_svc_handler()`
+
+4. **Syscall 分發**：
+   - 從 x8 讀取 syscall number
+   - 查 `sys_call_table[64]` 取得 `sys_write` 指標
+   - 呼叫 `sys_write(fd, buf, count)`
+
+5. **返回 User Space**：
+   - 返回值放入 x0
+   - `ret_to_user` 恢復 pt_regs
+   - `eret` 返回 EL0
+
+---
+
+### Q12: 什麼是 vDSO？它如何加速 syscall？
+
+**難度**：⭐⭐⭐⭐
+
+**標準答案**：
+
+**vDSO (Virtual Dynamic Shared Object)**：
+- Kernel 自動映射到每個 Process 的共享記憶體區
+- 包含不需要真正進入 Kernel 的 "快速 syscall"
+
+**工作原理**：
+- Kernel 將唯讀資料（如時間）映射到 User Space
+- glibc 呼叫 vDSO 函式直接讀取，不觸發 mode switch
+- 節省大約 100-200 cycles
+
+**常見 vDSO 函式**：
+- `clock_gettime()`
+- `gettimeofday()`
+- `getcpu()`
+
+---
+
+### Q13: `devm_request_irq` 和 `request_irq` 有什麼區別？
+
+**難度**：⭐⭐⭐⭐
+**常見於**：普遍（Driver 開發必問）
+
+**標準答案**：
+
+| 特性 | request_irq | devm_request_irq |
+|:---|:---|:---|
+| 資源管理 | 手動 | 自動 |
+| 釋放方式 | 必須呼叫 free_irq() | Device 移除時自動釋放 |
+| 記憶體洩漏風險 | 高（容易忘記釋放）| 低（自動管理）|
+| 適用場景 | 需要精確控制生命週期 | 一般 Driver 開發 |
+
+**最佳實踐**：
+- Driver 開發優先使用 `devm_` 系列 API
+- 減少樣板程式碼，降低 bug 風險
+- 讓 remove() 函式盡可能簡單
+
+---
+
+### Q14: EXPORT_SYMBOL 和 EXPORT_SYMBOL_GPL 有什麼區別？
+
+**難度**：⭐⭐⭐
+
+**標準答案**：
+
+| 特性 | EXPORT_SYMBOL | EXPORT_SYMBOL_GPL |
+|:---|:---|:---|
+| 可見範圍 | 所有模組 | 僅 GPL 授權模組 |
+| 使用場景 | 通用 API | 核心內部 API |
+
+**GPL 限制的原因**：
+- 保護 Kernel 核心功能
+- 鼓勵開放原始碼
+- 阻止專有驅動使用深層 Kernel API
+
+**常見 GPL-only 符號**：
+- `schedule()`
+- `kmalloc()` 的某些變體
+- 許多 Power Management API
+
+---
+
 ## ✅ 章節完成報告
 
 - 檔案：`/05_作業系統/Linux核心概念.md`
-- 擴充後行數：約 800 行
+- 最終行數：~1400 行
 - 涵蓋：
   - ✅ task_struct、Kernel/User Stack、Context Switch 組語
   - ✅ MMU/TLB/Page Table、Page Fault Handling
@@ -917,4 +1559,8 @@ consumer:
   - ✅ Top-half/Bottom-half、Workqueue/Tasklet
   - ✅ Deadlock 條件與預防
   - ✅ Priority Inversion
-  - ✅ 10 道面試題
+  - ✅ **System Call 完整流程 (ARM64)**
+  - ✅ **Kernel Module 開發**
+  - ✅ **vDSO 機制**
+  - ✅ **devm_ API**
+  - ✅ 14 道面試題
