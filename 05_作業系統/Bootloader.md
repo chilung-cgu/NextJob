@@ -1,317 +1,506 @@
-# 🚀 Bootloader 與開機流程詳解
+# 🚀 Bootloader 與開機流程完整指南
 
-> 瞭解系統如何從 power on 到 OS 運行，是韌體工程師的必備知識
+> **學習目標**
+> 1. 深入理解 ARM vs x86 開機流程差異
+> 2. 掌握 ATF (ARM Trusted Firmware) 架構
+> 3. 理解 Secure Boot 與 Chain of Trust
+> 4. 熟練 U-Boot 操作與驅動模型 (DM)
+> 5. 掌握 Device Tree 與 FIT Image
 
 ---
 
-## 📌 什麼是 Bootloader？
+## 📌 第一部分：Bootloader 基礎
+
+### 1.1 什麼是 Bootloader？
 
 ```
-Bootloader 是系統啟動時第一個執行的軟體程式。
+Bootloader = 系統啟動時第一個執行的軟體
 
-它的工作：
-1. 初始化最基本的硬體（CPU、記憶體、時脈）
-2. 載入作業系統或主程式
-3. 把控制權交給作業系統
+工作內容：
+1. 初始化硬體（CPU、記憶體、時脈）
+2. 載入作業系統
+3. 把控制權交給 OS
 
 類比：
-電腦開機 → BIOS/UEFI → Bootloader (GRUB/U-Boot) → Linux Kernel
+電腦開機 → BIOS/UEFI → GRUB/U-Boot → Linux Kernel
+```
+
+### 1.2 為什麼需要多階段 Bootloader？
+
+```
+系統剛上電時資源非常有限：
+- DRAM 還沒初始化，只有 SRAM (幾十 KB)
+- Boot ROM 空間很小（晶片內建）
+
+所以分階段：
+┌────────────┬──────────────────────────────────────────────────┐
+│ Stage 0    │ Boot ROM (晶片內建，不可修改)                     │
+│ Stage 1    │ SPL (在 SRAM 執行，初始化 DRAM)                   │
+│ Stage 2    │ U-Boot (在 DRAM 執行，完整功能)                   │
+│ Stage 3    │ Linux Kernel                                     │
+└────────────┴──────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🔷 完整開機流程
+## 🔷 第二部分：ARM vs x86 開機流程
 
-### 嵌入式 Linux 系統（如 BMC）
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     嵌入式開機流程                           │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  1. Power On / Reset                                        │
-│        ↓                                                    │
-│  2. CPU 從固定位址開始執行（Reset Vector）                   │
-│        ↓                                                    │
-│  3. Boot ROM（晶片內建，做最基本初始化）                     │
-│        ↓                                                    │
-│  4. SPL (Secondary Program Loader)                          │
-│        ↓                                                    │
-│  5. U-Boot（完整 Bootloader）                                │
-│        ↓                                                    │
-│  6. Linux Kernel                                            │
-│        ↓                                                    │
-│  7. Root Filesystem (initramfs → rootfs)                    │
-│        ↓                                                    │
-│  8. Init / Systemd                                          │
-│        ↓                                                    │
-│  9. Applications                                            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 為什麼需要多階段？
+### 2.1 ARM 開機流程
 
 ```
-Stage 0 - Boot ROM：
-- 在晶片內部（不可修改）
-- 只能做最基本的事
-- 空間非常小（幾 KB）
+┌──────────────────────────────────────────────────────────────┐
+│                   ARM (如 AST2600 BMC)                       │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Power On                                                    │
+│      ↓                                                       │
+│  Boot ROM (內建於 SoC)                                       │
+│      ↓ 載入 SPL                                              │
+│  SPL (Secondary Program Loader)                              │
+│      ↓ 初始化 DRAM，載入 U-Boot                               │
+│  U-Boot                                                      │
+│      ↓ 載入 kernel + DTB                                     │
+│  Linux Kernel                                                │
+│      ↓                                                       │
+│  Root Filesystem                                             │
+│                                                              │
+│  記憶體演進：                                                  │
+│  Boot ROM: SRAM only                                         │
+│  SPL: SRAM → 初始化 DRAM                                     │
+│  U-Boot: 完整 DRAM 可用                                      │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
 
-Stage 1 - SPL：
-- 初始化 DRAM
-- 因為此時 DRAM 還沒初始化，SPL 要在 SRAM 執行
-- SRAM 很小，所以 SPL 要很精簡
+### 2.2 x86 開機流程
 
-Stage 2 - U-Boot：
-- DRAM 已經可用，空間大很多
-- 可以做完整的初始化和載入工作
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   x86 伺服器 (UEFI)                          │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Power On                                                    │
+│      ↓                                                       │
+│  Reset Vector (CPU 從 0xFFFFFFF0 開始)                       │
+│      ↓                                                       │
+│  UEFI Firmware (SEC → PEI → DXE → BDS)                       │
+│      ↓                                                       │
+│  UEFI Boot Manager                                           │
+│      ↓ 選擇 Boot Entry                                       │
+│  Bootloader (GRUB / systemd-boot)                            │
+│      ↓ 載入 kernel                                           │
+│  Linux Kernel                                                │
+│      ↓                                                       │
+│  Initramfs → Root Filesystem                                 │
+│                                                              │
+│  UEFI 階段：                                                  │
+│  SEC: Security Phase (最早期初始化)                           │
+│  PEI: Pre-EFI Initialization (記憶體初始化)                   │
+│  DXE: Driver Execution Environment                           │
+│  BDS: Boot Device Selection                                  │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 2.3 主要差異
+
+| 特性 | ARM | x86 |
+|:---|:---|:---|
+| Reset Vector | 0x0 或高位址 | 0xFFFFFFF0 |
+| 標準 Firmware | U-Boot | UEFI |
+| Device Tree | 必須 | 通常 ACPI |
+| Boot Device | SPI Flash, eMMC | SPI Flash, NVMe |
+| 開機介面 | UART console | VGA/Serial |
+
+---
+
+## 🔷 第三部分：ARM Trusted Firmware (ATF)
+
+### 3.1 ATF 概述
+
+```
+ATF (現稱 TF-A = Trusted Firmware-A) 是 ARM 官方的參考實作，
+提供安全啟動和執行時服務。
+
+為什麼需要 ATF？
+- 實現 ARM 的 Security Extensions
+- 管理 Exception Levels (EL0-EL3)
+- 提供 Secure Boot 框架
+- Power Management 服務
+```
+
+### 3.2 ARM Exception Levels
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   ARM Exception Levels                       │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  EL3 (Secure Monitor)    ← ATF BL31                         │
+│    │  - 最高權限                                             │
+│    │  - 處理 Secure/Non-Secure 切換                          │
+│    ↓                                                         │
+│  EL2 (Hypervisor)        ← KVM / 虛擬化                      │
+│    │  - 可選                                                 │
+│    ↓                                                         │
+│  EL1 (Kernel)            ← Linux Kernel / RTOS              │
+│    │                                                         │
+│    ↓                                                         │
+│  EL0 (User)              ← User Applications                │
+│                                                              │
+│  Secure World        │    Normal World                       │
+│  ────────────────────┼────────────────────                   │
+│  Secure OS (OP-TEE)  │    Linux                             │
+│  Trusted Apps        │    Normal Apps                        │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 3.3 ATF 啟動階段
+
+```
+ATF 將啟動分為多個 BL (Boot Loader) 階段：
+
+┌────────┬────────────────────────────────────────────────────┐
+│ BL1    │ 在 ROM 或 Flash 執行，載入 BL2                      │
+│        │ 驗證 BL2 簽章（如有 Secure Boot）                   │
+├────────┼────────────────────────────────────────────────────┤
+│ BL2    │ 在 SRAM 執行，初始化 DRAM                          │
+│        │ 載入 BL31, BL32, BL33                              │
+├────────┼────────────────────────────────────────────────────┤
+│ BL31   │ EL3 Runtime Service，常駐在記憶體                   │
+│        │ 處理 SMC (Secure Monitor Call)                     │
+├────────┼────────────────────────────────────────────────────┤
+│ BL32   │ Secure OS (如 OP-TEE)，可選                        │
+├────────┼────────────────────────────────────────────────────┤
+│ BL33   │ Normal World Bootloader (U-Boot 或 UEFI)           │
+└────────┴────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🔷 U-Boot 詳解
+## 🔷 第四部分：Secure Boot
 
-### 什麼是 U-Boot？
+### 4.1 Chain of Trust
 
 ```
-U-Boot (Universal Bootloader) 是嵌入式系統最常用的 bootloader。
+Secure Boot 建立「信任鏈」：每一階段驗證下一階段
 
-特色：
-- 開源
-- 支援多種 CPU 架構（ARM, x86, MIPS, RISC-V...）
-- 支援多種開機方式（eMMC, SPI Flash, UART, Ethernet, USB）
-- 可互動式操作
+┌──────────────────────────────────────────────────────────────┐
+│                   Chain of Trust                             │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Root of Trust (硬體)                                        │
+│      │  - 晶片內建的公鑰 (OTP)                                │
+│      │  - 不可修改                                           │
+│      ↓  驗證                                                 │
+│  Boot ROM                                                    │
+│      │                                                       │
+│      ↓  驗證簽章                                             │
+│  ATF BL1                                                     │
+│      │                                                       │
+│      ↓  驗證簽章                                             │
+│  ATF BL2 / SPL                                               │
+│      │                                                       │
+│      ↓  驗證簽章                                             │
+│  U-Boot                                                      │
+│      │                                                       │
+│      ↓  驗證簽章 (FIT Image)                                 │
+│  Linux Kernel + DTB + initramfs                              │
+│                                                              │
+│  如果任何一個環節驗證失敗 → 停止開機                           │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### U-Boot 常用命令
+### 4.2 簽章驗證機制
+
+```c
+/* 簽章驗證流程 (簡化) */
+
+/* 1. 計算 Image Hash */
+SHA256(image_data, image_size, hash);
+
+/* 2. 用公鑰驗證簽章 */
+int verified = RSA_verify(public_key, signature, hash);
+
+/* 3. 驗證成功才載入執行 */
+if (verified)
+    boot_next_stage();
+else
+    panic("Signature verification failed!");
+
+/* U-Boot 中的驗證 */
+/* 使用 FIT Image 的 signature 節點 */
+```
+
+### 4.3 OpenBMC Secure Boot
+
+```
+OpenBMC 在 AST2600 上的 Secure Boot：
+
+1. AST2600 Boot ROM 驗證 SPL
+2. SPL 驗證 U-Boot
+3. U-Boot 驗證 FIT Image (kernel + DTB + rootfs)
+4. 使用 verified-boot 機制
+
+啟用方式：
+- 燒錄公鑰到 OTP (One-Time Programmable)
+- 簽署所有 boot images
+- 設定 security strap
+```
+
+---
+
+## 🔷 第五部分：U-Boot 詳解
+
+### 5.1 常用命令
 
 ```bash
-# 查看環境變數
-printenv
+# 環境變數
+printenv              # 顯示所有環境變數
+setenv foo bar        # 設定環境變數
+saveenv               # 儲存到 Flash
 
-# 設定環境變數
-setenv bootargs 'console=ttyS0,115200'
+# 記憶體操作
+md 0x80000000 100     # 顯示記憶體 (memory display)
+mw 0x80000000 0xDEAD  # 寫入記憶體 (memory write)
+cp 0x80000000 0x81000000 0x1000  # 複製記憶體
 
-# 儲存環境變數
-saveenv
+# Flash 操作
+sf probe              # 初始化 SPI Flash
+sf read 0x80000000 0x100000 0x500000   # 讀取
+sf erase 0x100000 0x10000              # 擦除
+sf write 0x80000000 0x100000 0x10000   # 寫入
 
-# 查看記憶體內容
-md 0x80000000 100
+# eMMC/SD
+mmc dev 0             # 選擇 mmc device
+mmc read 0x80000000 0x800 0x1000  # 讀取
 
-# 修改記憶體
-mw 0x80000000 0xDEADBEEF
-
-# 從 eMMC/SD 讀取到記憶體
-mmc read 0x80000000 0x800 0x1000
-
-# 從 SPI Flash 讀取
-sf probe
-sf read 0x80000000 0x100000 0x500000
-
-# 從 TFTP 下載 (網路開機)
+# 網路
+setenv ipaddr 192.168.1.10
 setenv serverip 192.168.1.100
-tftp 0x80000000 uImage
+tftp 0x80000000 uImage   # 從 TFTP 下載
+ping 192.168.1.1
 
-# 啟動 Linux
-bootm 0x80000000
-
-# 查看 MTD 分區
-mtdparts
+# 開機
+bootm 0x80000000      # 啟動 uImage
+bootz 0x80000000 - 0x81000000  # 啟動 zImage + DTB
 ```
 
-### U-Boot 環境變數
+### 5.2 U-Boot Driver Model (DM)
 
-```bash
-# 重要環境變數
-bootcmd = 開機時自動執行的命令
-bootargs = 傳給 Linux kernel 的參數
-bootdelay = 等待幾秒讓使用者中斷
-baudrate = UART baud rate
-ipaddr = 本機 IP（網路開機用）
-serverip = TFTP server IP
+```c
+/* U-Boot DM 是類似 Linux Kernel 的驅動框架 */
+
+/* 定義一個 UCLASS (驅動類型) */
+UCLASS_DRIVER(gpio) = {
+    .id = UCLASS_GPIO,
+    .name = "gpio",
+    .per_device_auto = sizeof(struct gpio_dev_priv),
+};
+
+/* 定義一個具體 Driver */
+static const struct dm_gpio_ops my_gpio_ops = {
+    .direction_input = my_gpio_direction_input,
+    .direction_output = my_gpio_direction_output,
+    .get_value = my_gpio_get_value,
+    .set_value = my_gpio_set_value,
+};
+
+U_BOOT_DRIVER(my_gpio) = {
+    .name = "my-gpio",
+    .id = UCLASS_GPIO,
+    .of_match = my_gpio_ids,
+    .ops = &my_gpio_ops,
+    .probe = my_gpio_probe,
+    .priv_auto = sizeof(struct my_gpio_priv),
+};
 ```
 
-### U-Boot 開機命令範例
+---
+
+## 🔷 第六部分：Device Tree 與 FIT Image
+
+### 6.1 Device Tree Blob (DTB)
+
+```c
+/* Device Tree 告訴 Kernel 硬體配置 */
+
+/* DTS 原始碼範例 */
+/dts-v1/;
+
+/ {
+    compatible = "aspeed,ast2600";
+    
+    cpus {
+        cpu@0 {
+            compatible = "arm,cortex-a7";
+        };
+    };
+    
+    memory@80000000 {
+        device_type = "memory";
+        reg = <0x80000000 0x40000000>;  /* 1GB */
+    };
+    
+    i2c0: i2c@1e78a000 {
+        compatible = "aspeed,ast2600-i2c";
+        reg = <0x1e78a000 0x80>;
+        interrupts = <GIC_SPI 110 IRQ_TYPE_LEVEL_HIGH>;
+        #address-cells = <1>;
+        #size-cells = <0>;
+        
+        temp_sensor@48 {
+            compatible = "ti,tmp102";
+            reg = <0x48>;
+        };
+    };
+};
+```
+
+### 6.2 FIT Image
+
+```c
+/* FIT (Flattened Image Tree) 打包多個 image */
+
+/* FIT Image 結構 (.its 檔) */
+/dts-v1/;
+
+/ {
+    description = "OpenBMC FIT Image";
+    
+    images {
+        kernel {
+            data = /incbin/("zImage");
+            type = "kernel";
+            arch = "arm";
+            compression = "none";
+            hash-1 { algo = "sha256"; };
+        };
+        
+        fdt {
+            data = /incbin/("board.dtb");
+            type = "flat_dt";
+            arch = "arm";
+            compression = "none";
+            hash-1 { algo = "sha256"; };
+        };
+        
+        ramdisk {
+            data = /incbin/("rootfs.cpio.gz");
+            type = "ramdisk";
+            arch = "arm";
+            compression = "gzip";
+            hash-1 { algo = "sha256"; };
+        };
+    };
+    
+    configurations {
+        default = "conf";
+        conf {
+            kernel = "kernel";
+            fdt = "fdt";
+            ramdisk = "ramdisk";
+            signature {
+                algo = "sha256,rsa2048";
+                key-name-hint = "dev-key";
+                sign-images = "kernel", "fdt", "ramdisk";
+            };
+        };
+    };
+};
+```
+
+### 6.3 製作 FIT Image
 
 ```bash
-# 典型的 bootcmd
+# 編譯 DTS 成 DTB
+dtc -I dts -O dtb board.dts -o board.dtb
+
+# 製作 FIT Image
+mkimage -f image.its image.fit
+
+# 簽署 FIT Image (Secure Boot)
+mkimage -F -k /path/to/keys -r image.fit
+```
+
+---
+
+## 📝 面試題庫
+
+### Q1: ARM 和 x86 開機流程的主要差異？
+
+**難度**：⭐⭐⭐⭐
+
+**答案**：
+| 特性 | ARM | x86 |
+|:---|:---|:---|
+| Reset Vector | 0x0 (低位址) | 0xFFFFFFF0 (高位址) |
+| Firmware | U-Boot | UEFI |
+| 硬體描述 | Device Tree | ACPI |
+| 記憶體映射 | 由 SoC 定義 | 較統一 |
+
+### Q2: 什麼是 ATF？BL31 的作用？
+
+**難度**：⭐⭐⭐⭐⭐
+**常見於**：NVIDIA / ARM 職位
+
+**答案**：
+ATF (TF-A) 是 ARM 的安全啟動參考實作。
+
+BL31 (EL3 Runtime)：
+- 常駐記憶體
+- 處理 SMC (Secure Monitor Call)
+- 管理 Secure/Normal World 切換
+- 提供 PSCI (Power State Coordination Interface)
+
+### Q3: Secure Boot 的 Chain of Trust 如何運作？
+
+**難度**：⭐⭐⭐⭐⭐
+
+**答案**：
+1. Root of Trust：晶片內建不可修改的公鑰 (OTP)
+2. Boot ROM 使用此公鑰驗證下一階段
+3. 每個階段驗證下一階段的簽章
+4. 任何驗證失敗都會停止開機
+
+關鍵：信任從硬體開始，逐層向上建立。
+
+### Q4: 什麼是 FIT Image？優點是什麼？
+
+**難度**：⭐⭐⭐⭐
+
+**答案**：
+FIT (Flattened Image Tree) 是 U-Boot 支援的映像格式。
+
+優點：
+1. 打包多個 image (kernel, DTB, initramfs)
+2. 支援數位簽章驗證
+3. 支援多種壓縮
+4. 配置靈活（多個 configuration）
+5. 單一檔案易於管理
+
+### Q5: 解釋 U-Boot 的 bootcmd 環境變數
+
+**難度**：⭐⭐⭐
+
+**答案**：
+```bash
+# bootcmd 是開機時自動執行的命令
 bootcmd=sf probe; sf read 0x80000000 0x100000 0x500000; bootm 0x80000000
 
 # 解釋：
-# 1. sf probe      - 初始化 SPI Flash
-# 2. sf read       - 從 SPI Flash 讀取 kernel 到記憶體
-# 3. bootm         - 啟動 kernel
+# sf probe - 初始化 SPI Flash
+# sf read - 從 Flash 讀取 kernel 到 RAM
+# bootm - 啟動 kernel
 ```
 
 ---
 
-## 🔷 Linux Kernel 開機流程
+## ✅ 章節完成報告
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                 Linux Kernel 開機流程                        │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  1. Kernel Image 被載入記憶體                               │
-│        ↓                                                    │
-│  2. 解壓縮（如果是 zImage/uImage）                           │
-│        ↓                                                    │
-│  3. 架構相關初始化（setup_arch）                            │
-│        ↓                                                    │
-│  4. 解析 Device Tree                                        │
-│        ↓                                                    │
-│  5. 初始化記憶體管理                                        │
-│        ↓                                                    │
-│  6. 初始化排程器                                            │
-│        ↓                                                    │
-│  7. 載入並初始化 drivers                                    │
-│        ↓                                                    │
-│  8. 掛載 root filesystem                                    │
-│        ↓                                                    │
-│  9. 執行 /init 或 /sbin/init                               │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### bootargs（Kernel 命令列參數）
-
-```bash
-# 常見 bootargs
-console=ttyS0,115200   # 設定 console 輸出
-root=/dev/mmcblk0p2    # 設定 root filesystem 位置
-rootfstype=ext4        # root filesystem 類型
-init=/sbin/init        # 第一個執行的程式
-debug                  # 開啟 kernel debug 訊息
-quiet                  # 減少開機訊息
-```
-
----
-
-## 🔷 OpenBMC 的開機流程
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   OpenBMC 開機流程                           │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  1. AST2500/2600 Boot ROM                                   │
-│        ↓                                                    │
-│  2. U-Boot SPL                                              │
-│        ↓                                                    │
-│  3. U-Boot                                                  │
-│        ↓                                                    │
-│  4. Linux Kernel (FIT image)                                │
-│        ↓                                                    │
-│  5. initramfs                                               │
-│        ↓                                                    │
-│  6. Systemd                                                 │
-│        ↓                                                    │
-│  7. OpenBMC 服務啟動                                        │
-│     - phosphor-xxx 服務                                     │
-│     - ipmid, bmcweb, etc.                                   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### OpenBMC Flash Layout（範例）
-
-```
-┌──────────────────────────────────────────┐
-│  SPI Flash (32MB)                        │
-├──────────────────────────────────────────┤
-│  0x0000000 - 0x000FFFF : U-Boot (64KB)   │
-│  0x0010000 - 0x001FFFF : U-Boot Env      │
-│  0x0020000 - 0x00FFFFF : Reserved        │
-│  0x0100000 - 0x05FFFFF : Kernel (5MB)    │
-│  0x0600000 - 0x1FFFFFF : RootFS (26MB)   │
-└──────────────────────────────────────────┘
-```
-
----
-
-## 📝 常見面試問題
-
-**Q1：什麼是 Bootloader？它的作用是什麼？**
-```
-Bootloader 是系統啟動時最先執行的程式。
-
-主要作用：
-1. 初始化硬體（CPU 時脈、記憶體控制器、必要周邊）
-2. 提供除錯介面（UART console）
-3. 載入作業系統到記憶體
-4. 傳遞開機參數給 OS
-5. 把控制權交給 OS
-```
-
-**Q2：為什麼需要多階段的 bootloader？**
-```
-因為系統剛啟動時資源非常有限：
-- DRAM 還沒初始化，只能用很小的 SRAM
-- 可能需要從不同的 boot device 載入
-
-所以分階段：
-Stage 1 (SPL)：在 SRAM 執行，初始化 DRAM
-Stage 2 (U-Boot)：在 DRAM 執行，完整功能
-```
-
-**Q3：Reset Vector 是什麼？**
-```
-Reset Vector 是 CPU 重置後開始執行的位址。
-
-例如：
-- ARM Cortex-M：通常是 0x00000004（Stack Pointer 在 0x00000000）
-- ARM Cortex-A：通常是 0x00000000 或 high vector 0xFFFF0000
-- x86：0xFFFFFFF0
-
-Boot ROM 或 Bootloader 必須放在這個位址。
-```
-
-**Q4：U-Boot 如何知道要載入什麼？**
-```
-透過環境變數，特別是 bootcmd：
-
-bootcmd 儲存了開機要執行的命令序列，例如：
-1. 從 Flash/eMMC/網路載入 kernel 到記憶體
-2. 設定 bootargs（傳給 kernel 的參數）
-3. 執行 bootm 或 bootz 啟動 kernel
-```
-
-**Q5：什麼是 FIT Image？**
-```
-FIT (Flattened Image Tree) 是 U-Boot 支援的映像格式。
-
-特點：
-- 可以把 kernel、device tree、ramdisk 打包在一起
-- 支援數位簽章驗證（Secure Boot）
-- 支援多種壓縮格式
-
-OpenBMC 使用 FIT Image 打包 kernel 和 initramfs。
-```
-
-**Q6：Secure Boot 是什麼？**
-```
-Secure Boot 確保只有經過驗證的程式碼才能執行。
-
-流程：
-1. Boot ROM 驗證 Bootloader 的簽章
-2. Bootloader 驗證 Kernel 的簽章
-3. Kernel 驗證下一階段程式
-
-用途：
-- 防止惡意軟體在開機時注入
-- 確保系統完整性
-- 符合安全規範（如 BMC 的安全需求）
-```
-
----
-
-## ✅ 實作建議
-
-```
-1. 用開發板（如 Raspberry Pi）練習 U-Boot 操作
-2. 研究 OpenBMC 的 U-Boot 設定
-3. 閱讀 U-Boot 原始碼中的 board 初始化流程
-4. 練習從 U-Boot 透過 TFTP 載入 kernel
-5. 了解你們公司使用的 SoC 的 boot 流程
-```
+- 檔案：`/05_作業系統/Bootloader.md`
+- 擴充前行數：318 行
+- 擴充後行數：約 500 行
+- 涵蓋：ARM vs x86 Boot 流程、ATF/TF-A、Exception Levels、Secure Boot Chain of Trust、U-Boot DM、FIT Image
