@@ -6,21 +6,8 @@ description: 重新打造 NextJob 外商韌體面試聖經 (觸發完整內容�
 
 此 Workflow 搭配 Skill 和詳細指令使用，逐章節深度擴充學習資料。
 
----
-
-## 🚨 強制規則 (Gate Check)
-
-> [!CAUTION]
-> 每個檔案完成後，**必須通過以下 Gate Check 才能繼續**：
-> 
-> 1. **行數達標**：執行 `wc -l <檔案>` 確認達到 rebuild-content.md 的行數要求
-> 2. **面試題數量**：確認有 10+ 題面試題
-> 3. **禁止宣稱完成卻達不到**：如果沒達標，**必須繼續擴充**，不可跳過
-> 
-> **如果 AI 衰減（越做越敷衍）**：
-> - 立即停止
-> - 重新讀取 SKILL.md 和 rebuild-content.md
-> - 從上次達標的檔案繼續
+> [!IMPORTANT]
+> **Gate Check 硬性規則定義在 `AGENT.md`**，每個檔案必須達標才能繼續。
 
 ---
 
