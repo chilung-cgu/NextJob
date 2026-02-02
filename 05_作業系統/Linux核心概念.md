@@ -553,9 +553,368 @@ TLB Miss：
 
 ---
 
+## 🔷 第六部分：中斷處理機制
+
+### 6.1 Top-half vs Bottom-half
+
+```
+中斷處理分為兩部分，以減少中斷禁用時間：
+
+┌──────────────────────────────────────────────────────────────┐
+│                    中斷處理機制                               │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Top-half (Hardirq)                                          │
+│  ─────────────────                                           │
+│  - 立即執行                                                   │
+│  - 禁用中斷期間                                               │
+│  - 必須快速完成                                               │
+│  - 不能睡眠                                                   │
+│  - 工作：清除中斷、讀取緊急資料、排程 Bottom-half             │
+│                                                              │
+│  Bottom-half                                                  │
+│  ───────────                                                 │
+│  1. Softirq：最底層，Kernel 編譯時定義                        │
+│  2. Tasklet：基於 Softirq，不能睡眠                            │
+│  3. Workqueue：在 Process Context 執行，可以睡眠              │
+│  4. Threaded IRQ：專用 Kernel Thread，現代 Driver 推薦        │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 Softirq 類型
+
+```c
+/* Kernel 預定義的 Softirq 類型 */
+enum {
+    HI_SOFTIRQ = 0,      /* 高優先權 tasklet */
+    TIMER_SOFTIRQ,       /* Timer */
+    NET_TX_SOFTIRQ,      /* 網路發送 */
+    NET_RX_SOFTIRQ,      /* 網路接收 */
+    BLOCK_SOFTIRQ,       /* Block device */
+    IRQ_POLL_SOFTIRQ,    /* IRQ polling */
+    TASKLET_SOFTIRQ,     /* Tasklet */
+    SCHED_SOFTIRQ,       /* Scheduler */
+    HRTIMER_SOFTIRQ,     /* High-resolution timer */
+    RCU_SOFTIRQ,         /* RCU */
+    NR_SOFTIRQS
+};
+
+/* Softirq 執行時機：
+ * 1. Hardirq 返回時（irq_exit()）
+ * 2. local_bh_enable()
+ * 3. ksoftirqd kernel thread（如果 softirq 太多）
+ */
+```
+
+### 6.3 Workqueue vs Tasklet
+
+```c
+/* Tasklet：不能睡眠 */
+static void my_tasklet_handler(unsigned long data)
+{
+    /* 不能使用 mutex，不能呼叫可能睡眠的函式 */
+    spin_lock(&my_lock);
+    /* 快速處理 */
+    spin_unlock(&my_lock);
+}
+static DECLARE_TASKLET(my_tasklet, my_tasklet_handler, 0);
+
+/* 在 ISR 中排程 */
+tasklet_schedule(&my_tasklet);
+
+/* Workqueue：可以睡眠 */
+static void my_work_handler(struct work_struct *work)
+{
+    /* 可以使用 mutex，可以做 I/O 操作 */
+    mutex_lock(&my_mutex);
+    /* 耗時處理 */
+    mutex_unlock(&my_mutex);
+}
+static DECLARE_WORK(my_work, my_work_handler);
+
+/* 在 ISR 中排程 */
+schedule_work(&my_work);
+```
+
+---
+
+## 🔷 第七部分：Deadlock 與 Priority Inversion
+
+### 7.1 Deadlock 條件
+
+```
+Deadlock 發生需要同時滿足四個條件：
+
+1. Mutual Exclusion（互斥）
+   - 資源一次只能被一個 task 持有
+
+2. Hold and Wait（持有並等待）
+   - 持有資源的同時等待另一個資源
+
+3. No Preemption（不可搶占）
+   - 已持有的資源不能被強制釋放
+
+4. Circular Wait（循環等待）
+   - 形成等待資源的環狀結構
+
+打破任一條件就可避免 Deadlock。
+```
+
+### 7.2 Deadlock 預防
+
+```c
+/* 方法 1：固定鎖順序（最常用） */
+/* 總是按照相同順序取得多個鎖 */
+
+/* 錯誤 */
+/* Thread A: lock(A) → lock(B) */
+/* Thread B: lock(B) → lock(A)  ← Deadlock! */
+
+/* 正確：定義順序 A < B，總是先鎖 A */
+mutex_lock(&lock_A);
+mutex_lock(&lock_B);
+/* ... */
+mutex_unlock(&lock_B);
+mutex_unlock(&lock_A);
+
+/* 方法 2：Trylock */
+if (mutex_trylock(&lock_B)) {
+    /* 成功取得 */
+} else {
+    mutex_unlock(&lock_A);  /* 釋放已持有的 */
+    /* 稍後重試 */
+}
+
+/* 方法 3：使用 lockdep 工具偵測 */
+/* CONFIG_PROVE_LOCKING 開啟 */
+/* Kernel 會追蹤鎖的取得順序，發現潛在問題時警告 */
+```
+
+### 7.3 Priority Inversion
+
+```
+Priority Inversion：高優先權任務被低優先權任務阻擋
+
+場景：
+1. 低優先權 Task L 持有 Lock
+2. 高優先權 Task H 需要 Lock，被阻塞
+3. 中優先權 Task M 搶占 Task L
+4. 結果：Task H 等待 Task M 完成！
+
+解決方案：
+┌─────────────────────┬────────────────────────────────────────┐
+│ Priority Inheritance │ 持有 Lock 的 Task 暫時提升優先權       │
+│ Priority Ceiling    │ Lock 有固定的最高優先權                │
+└─────────────────────┴────────────────────────────────────────┘
+
+Linux Kernel 實作：
+- rt_mutex：支援 Priority Inheritance
+- 普通 mutex：不支援（因為通常不用於 RT）
+```
+
+---
+
+## 📝 更多面試題
+
+### Q5: fork() 和 clone() 的差異？
+
+**難度**：⭐⭐⭐⭐
+
+**答案**：
+```
+fork()：
+- 建立完整的 Process 副本
+- 複製整個 address space（COW）
+- 不共享任何資源
+- 回傳兩次（父子各一次）
+
+clone()：
+- 可選擇共享哪些資源
+- CLONE_VM：共享 address space（Thread 的本質）
+- CLONE_FILES：共享 file descriptor table
+- CLONE_SIGHAND：共享 signal handler
+
+關係：
+- fork() 內部呼叫 clone() + 特定 flags
+- pthread_create() 呼叫 clone(CLONE_VM | CLONE_FS | ...)
+- vfork() 呼叫 clone(CLONE_VFORK | CLONE_VM | ...)
+```
+
+### Q6: 什麼是 Copy-on-Write (COW)？
+
+**難度**：⭐⭐⭐⭐
+
+**答案**：
+```
+COW 是一種延遲複製優化技術。
+
+fork() 時：
+1. 不複製整個 address space
+2. 父子共享相同的 Page（標記為 Read-only）
+3. 任一方寫入時，觸發 Page Fault
+4. 此時才複製該 Page（私有副本）
+
+優點：
+- fork() 很快（只複製 page table）
+- 只複製實際被修改的 page
+- 對 fork + exec 特別有效（exec 會丟棄原有 pages）
+
+實作：
+- Page Table Entry 設定為 Read-only
+- 寫入時觸發 Page Fault
+- do_wp_page() 處理：分配新 page，複製內容，更新 mapping
+```
+
+### Q7: 什麼是 OOM Killer？
+
+**難度**：⭐⭐⭐⭐
+
+**答案**：
+```
+OOM (Out of Memory) Killer 在記憶體耗盡時終止 process。
+
+觸發時機：
+1. 記憶體不足且無法回收
+2. 或記憶體壓力過大
+
+選擇受害者：
+- 計算 oom_score（基於記憶體使用量）
+- 考慮 oom_score_adj（使用者調整值）
+- 選擇分數最高的 process 殺死
+
+調整 OOM 行為：
+# 查看/設定 oom_score_adj (-1000 到 1000)
+cat /proc/<pid>/oom_score_adj
+echo -1000 > /proc/<pid>/oom_score_adj  # 永不被殺
+
+避免 OOM：
+- 合理設定 vm.overcommit_memory
+- 使用 cgroups 限制記憶體
+- 給關鍵 process 設定低 oom_score_adj
+```
+
+### Q8: 解釋 Kernel 的 Preemption Model
+
+**難度**：⭐⭐⭐⭐⭐
+
+**答案**：
+```
+Linux 提供多種搶占模型：
+
+1. PREEMPT_NONE（無搶占）
+   - 只在 syscall 返回時才可能 schedule
+   - 適合：Server（最大吞吐量）
+
+2. PREEMPT_VOLUNTARY
+   - 在特定檢查點允許搶占
+   - 適合：Desktop
+
+3. PREEMPT（完全搶占）
+   - 除了持有 spinlock 外，可以隨時搶占
+   - 適合：低延遲需求
+
+4. PREEMPT_RT（Real-Time）
+   - 將 spinlock 改為可搶占的 rt_mutex
+   - 極低延遲
+   - 適合：工業控制、音訊
+
+preempt_count：
+- 搶占計數器，> 0 時禁止搶占
+- spin_lock：preempt_count++
+- spin_unlock：preempt_count--
+```
+
+### Q9: 什麼是 LKML 常見的 Race Condition Pattern？
+
+**難度**：⭐⭐⭐⭐⭐
+
+**答案**：
+```c
+/* Pattern 1: TOCTOU (Time-of-Check to Time-of-Use) */
+/* 錯誤 */
+if (ptr != NULL) {
+    /* 另一個 thread 可能在此時清除 ptr */
+    use(ptr);
+}
+/* 正確 */
+spin_lock(&lock);
+if (ptr != NULL)
+    use(ptr);
+spin_unlock(&lock);
+
+/* Pattern 2: Double Fetch */
+/* 錯誤：從 user space 讀取兩次 */
+if (copy_from_user(&size, uptr, sizeof(size)))
+    return -EFAULT;
+/* 惡意程式可能在兩次讀取之間修改 */
+buf = kmalloc(size, GFP_KERNEL);
+copy_from_user(buf, uptr + sizeof(size), size);  /* size 可能已變 */
+
+/* 正確：一次複製到 kernel */
+struct user_data data;
+copy_from_user(&data, uptr, sizeof(data));
+/* 使用 kernel 中的 data.size */
+
+/* Pattern 3: Use-After-Free */
+/* ISR 和主程式共享資料結構時特別危險 */
+kfree(ptr);
+ptr = NULL;  /* 即使設為 NULL，另一個 CPU 可能已拿到舊值 */
+
+/* 使用 RCU 安全釋放 */
+call_rcu(&ptr->rcu, free_callback);
+```
+
+### Q10: Memory Barrier 使用範例？
+
+**難度**：⭐⭐⭐⭐⭐
+
+**答案**：
+```c
+/* Producer-Consumer Pattern */
+
+/* 錯誤：CPU 可能重排序 */
+producer:
+    data = 42;
+    ready = 1;
+
+consumer:
+    while (!ready);
+    use(data);  /* 可能讀到舊的 data！ */
+
+/* 正確：使用 Memory Barrier */
+producer:
+    data = 42;
+    smp_wmb();  /* Write barrier: data 一定在 ready 之前寫入 */
+    ready = 1;
+
+consumer:
+    while (!ready);
+    smp_rmb();  /* Read barrier: ready 之後的讀取不會被提前 */
+    use(data);
+
+/* 更好的做法：使用 atomic 配對 */
+producer:
+    WRITE_ONCE(data, 42);
+    smp_store_release(&ready, 1);
+
+consumer:
+    while (!smp_load_acquire(&ready));
+    use(READ_ONCE(data));
+```
+
+---
+
 ## ✅ 章節完成報告
 
 - 檔案：`/05_作業系統/Linux核心概念.md`
-- 擴充前行數：327 行
-- 擴充後行數：約 550 行
-- 涵蓋：task_struct、Kernel/User Stack、Context Switch 組語、MMU/TLB/Page Table、CFS vruntime、Spinlock/Mutex/RCU
+- 擴充後行數：約 800 行
+- 涵蓋：
+  - ✅ task_struct、Kernel/User Stack、Context Switch 組語
+  - ✅ MMU/TLB/Page Table、Page Fault Handling
+  - ✅ CFS vruntime 計算
+  - ✅ Spinlock/Mutex/RCU
+  - ✅ Top-half/Bottom-half、Workqueue/Tasklet
+  - ✅ Deadlock 條件與預防
+  - ✅ Priority Inversion
+  - ✅ 10 道面試題
