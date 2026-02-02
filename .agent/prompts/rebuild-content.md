@@ -88,11 +88,30 @@
 
 ### 05_作業系統 (目標：每個檔案 2000+ 行)
 
+> [!NOTE]
+> 此章節應包含 4 個檔案，每個專注一個主題。
+
 #### Linux核心概念.md
--   Process/Thread：包含 Linux 的 `task_struct`、Kernel Stack vs User Stack、Context Switch 的 Assembly 層面流程。
--   Memory：Physical/Virtual Address 轉換、MMU/TLB、Page Table (PGD/PUD/PMD/PTE)、NUMA、Memory Barrier (`mb()`, `rmb()`, `wmb()`)。
+-   Process/Thread：Linux 的 `task_struct`、`clone()` vs `fork()`、`kthread`。
+-   Kernel Stack vs User Stack：大小、用途、切換時機。
+-   Context Switch：Assembly 層面流程、暫存器保存/恢復、TLB flush。
 -   Scheduler：CFS 的 vruntime 計算、調度類別 (RT, DL, CFS)、load balancing。
--   Synchronization：Spinlock vs Mutex vs Semaphore vs RCU，各自的使用場景與 Kernel 原始碼節選。
+
+#### 記憶體管理.md（需新增）
+-   Virtual Memory：Physical/Virtual Address 轉換、為什麼需要虛擬記憶體。
+-   MMU/TLB：硬體架構、TLB miss 處理流程、ASID。
+-   Page Table：ARM64 四級頁表 (PGD/PUD/PMD/PTE)、Page Table Entry 格式。
+-   Page Fault：Minor/Major Fault、COW (Copy-on-Write)、Demand Paging。
+-   OOM Killer：oom_score 計算、oom_score_adj 調整、避免 OOM 策略。
+-   Memory Barrier：`mb()`, `rmb()`, `wmb()`、使用場景、常見錯誤。
+
+#### Kernel同步機制.md（需新增）
+-   Spinlock：實作原理、spin_lock_irqsave、何時使用。
+-   Mutex：vs Spinlock、Priority Inversion、rt_mutex。
+-   Semaphore：計數信號量、Binary Semaphore vs Mutex。
+-   RCU：Read-Copy-Update 原理、使用場景、API。
+-   Completion：等待機制、vs wait_event。
+-   Deadlock：四個條件、預防方法、lockdep 工具。
 
 #### Bootloader.md
 -   ARM Trusted Firmware (ATF/TF-A) 的 BL1/BL2/BL31/BL33 流程。
