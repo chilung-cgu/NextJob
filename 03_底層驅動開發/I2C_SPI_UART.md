@@ -1345,3 +1345,1098 @@ RX = Receive  = 接收（我的耳朵）
    SPI 用來讀寫 SPI Flash 韌體，
    UART 用來輸出 Debug Log...」
 ```
+
+---
+
+## 🔷 Linux Kernel I2C Subsystem 架構
+
+### I2C Subsystem 三大核心結構
+
+```c
+/* include/linux/i2c.h */
+
+/*
+ * Linux I2C Subsystem 架構：
+ *
+ *  ┌─────────────────────────────────────────────────────┐
+ *  │                    Application                       │
+ *  │               (read/write /dev/i2c-N)                │
+ *  └────────────────────────┬────────────────────────────┘
+ *                           ↓
+ *  ┌─────────────────────────────────────────────────────┐
+ *  │                 I2C Core (i2c-core.c)               │
+ *  │     • i2c_transfer() / i2c_smbus_*()                 │
+ *  │     • Device/Driver 匹配                              │
+ *  └────────────────────────┬────────────────────────────┘
+ *                           ↓
+ *  ┌─────────────────────────────────────────────────────┐
+ *  │               I2C Adapter (i2c_adapter)             │
+ *  │     • 代表 I2C Controller 硬體                       │
+ *  │     • 實作 master_xfer() 進行實際傳輸                │
+ *  └────────────────────────┬────────────────────────────┘
+ *                           ↓
+ *  ┌─────────────────────────────────────────────────────┐
+ *  │                  I2C Hardware                        │
+ *  │            (SoC I2C Controller)                      │
+ *  └─────────────────────────────────────────────────────┘
+ */
+
+/* 1. I2C Adapter - 代表 I2C Controller (Master) */
+struct i2c_adapter {
+    struct module *owner;
+    unsigned int class;               /* I2C_CLASS_HWMON, I2C_CLASS_DDC... */
+    const struct i2c_algorithm *algo; /* 傳輸演算法 */
+    void *algo_data;                  /* 演算法私有資料 */
+    
+    struct device dev;                /* sysfs 節點 */
+    int nr;                           /* adapter 編號 (0, 1, 2...) */
+    char name[48];                    /* adapter 名稱 */
+    
+    struct completion dev_released;
+    
+    int timeout;                      /* 傳輸超時 (jiffies) */
+    int retries;                      /* 重試次數 */
+    
+    /* ... */
+};
+
+/* 2. I2C Client - 代表 I2C 上的一個裝置 (Slave) */
+struct i2c_client {
+    unsigned short flags;             /* I2C_CLIENT_TEN 等 */
+    unsigned short addr;              /* 7-bit 或 10-bit 地址 */
+    
+    char name[I2C_NAME_SIZE];         /* 裝置名稱 */
+    
+    struct i2c_adapter *adapter;      /* 所屬的 adapter */
+    struct device dev;                /* sysfs 節點 */
+    int init_irq;                     /* 中斷號碼 */
+    int irq;                          /* 中斷號碼 */
+    
+    /* ... */
+};
+
+/* 3. I2C Driver - 代表 I2C 裝置的驅動程式 */
+struct i2c_driver {
+    unsigned int class;
+    
+    int (*probe)(struct i2c_client *client);        /* 新版 probe */
+    int (*remove)(struct i2c_client *client);
+    void (*shutdown)(struct i2c_client *client);
+    
+    struct device_driver driver;                    /* 內嵌 device_driver */
+    const struct i2c_device_id *id_table;           /* 舊版 ID 匹配 */
+    
+    /* ... */
+};
+```
+
+### I2C Driver 完整實作範例
+
+```c
+/* 假設要寫一個 LM75 溫度 Sensor 的 Driver */
+
+#include <linux/module.h>
+#include <linux/i2c.h>
+#include <linux/hwmon.h>
+
+#define LM75_REG_TEMP   0x00
+#define LM75_REG_CONF   0x01
+
+struct lm75_data {
+    struct i2c_client *client;
+    struct mutex lock;
+    int temp;  /* 溫度值，milli-degrees */
+};
+
+/* 讀取溫度 */
+static int lm75_read_temp(struct lm75_data *data)
+{
+    struct i2c_client *client = data->client;
+    int ret;
+    u8 buf[2];
+    
+    /* 使用 I2C 讀取暫存器 */
+    ret = i2c_smbus_read_word_swapped(client, LM75_REG_TEMP);
+    if (ret < 0) {
+        dev_err(&client->dev, "Failed to read temperature\n");
+        return ret;
+    }
+    
+    /* LM75 溫度格式：16-bit，高 9 位是溫度，0.5°C 解析度 */
+    data->temp = (s16)ret >> 7;  /* 取高 9 位 */
+    data->temp *= 500;           /* 轉換成 milli-degrees */
+    
+    return 0;
+}
+
+/* sysfs 屬性 */
+static ssize_t temp_show(struct device *dev,
+                         struct device_attribute *attr, char *buf)
+{
+    struct lm75_data *data = dev_get_drvdata(dev);
+    int ret;
+    
+    mutex_lock(&data->lock);
+    ret = lm75_read_temp(data);
+    mutex_unlock(&data->lock);
+    
+    if (ret)
+        return ret;
+    
+    return sysfs_emit(buf, "%d\n", data->temp);
+}
+static DEVICE_ATTR_RO(temp);
+
+static struct attribute *lm75_attrs[] = {
+    &dev_attr_temp.attr,
+    NULL,
+};
+ATTRIBUTE_GROUPS(lm75);
+
+/* Probe 函式 */
+static int lm75_probe(struct i2c_client *client)
+{
+    struct lm75_data *data;
+    int ret;
+    
+    /* 確認 I2C 功能 */
+    if (!i2c_check_functionality(client->adapter, 
+            I2C_FUNC_SMBUS_WORD_DATA)) {
+        dev_err(&client->dev, "Adapter doesn't support SMBus word\n");
+        return -ENODEV;
+    }
+    
+    data = devm_kzalloc(&client->dev, sizeof(*data), GFP_KERNEL);
+    if (!data)
+        return -ENOMEM;
+    
+    data->client = client;
+    mutex_init(&data->lock);
+    
+    i2c_set_clientdata(client, data);
+    
+    /* 讀取初始溫度確認裝置正常 */
+    ret = lm75_read_temp(data);
+    if (ret) {
+        dev_err(&client->dev, "Failed to read initial temp\n");
+        return ret;
+    }
+    
+    dev_info(&client->dev, "LM75 detected, temp = %d mC\n", data->temp);
+    
+    return 0;
+}
+
+/* Device Tree 匹配 */
+static const struct of_device_id lm75_of_match[] = {
+    { .compatible = "national,lm75" },
+    { .compatible = "ti,tmp75" },
+    { }
+};
+MODULE_DEVICE_TABLE(of, lm75_of_match);
+
+/* I2C ID Table（舊版匹配） */
+static const struct i2c_device_id lm75_id[] = {
+    { "lm75", 0 },
+    { "tmp75", 0 },
+    { }
+};
+MODULE_DEVICE_TABLE(i2c, lm75_id);
+
+static struct i2c_driver lm75_driver = {
+    .driver = {
+        .name = "lm75",
+        .of_match_table = lm75_of_match,
+        .dev_groups = lm75_groups,
+    },
+    .probe = lm75_probe,
+    .id_table = lm75_id,
+};
+module_i2c_driver(lm75_driver);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Your Name");
+MODULE_DESCRIPTION("LM75 Temperature Sensor Driver");
+```
+
+### Device Tree 配置
+
+```dts
+/* 在 Device Tree 中定義 I2C 裝置 */
+
+&i2c1 {
+    status = "okay";
+    clock-frequency = <400000>;  /* 400kHz Fast Mode */
+    
+    /* LM75 溫度 Sensor @ 地址 0x48 */
+    temp_sensor: lm75@48 {
+        compatible = "national,lm75";
+        reg = <0x48>;
+    };
+    
+    /* EEPROM @ 地址 0x50 */
+    eeprom: at24@50 {
+        compatible = "atmel,24c256";
+        reg = <0x50>;
+        pagesize = <64>;
+    };
+};
+```
+
+### I2C SMBus API 詳解
+
+```c
+/* SMBus (System Management Bus) 是 I2C 的子集 */
+/* 大部分 Sensor/EEPROM 都使用 SMBus 協定 */
+
+/* Quick Command (只有地址，沒有資料) */
+int i2c_smbus_quick(struct i2c_client *client, u8 value);
+
+/* Read/Write Byte */
+s32 i2c_smbus_read_byte(struct i2c_client *client);
+s32 i2c_smbus_write_byte(struct i2c_client *client, u8 value);
+
+/* Read/Write Byte Data (有 Register 地址) */
+s32 i2c_smbus_read_byte_data(struct i2c_client *client, u8 command);
+s32 i2c_smbus_write_byte_data(struct i2c_client *client, u8 command, u8 value);
+
+/* Read/Write Word Data (16-bit) */
+s32 i2c_smbus_read_word_data(struct i2c_client *client, u8 command);
+s32 i2c_smbus_write_word_data(struct i2c_client *client, u8 command, u16 value);
+
+/* Swapped Word (位元組順序交換) */
+s32 i2c_smbus_read_word_swapped(struct i2c_client *client, u8 command);
+
+/* Block Read/Write */
+s32 i2c_smbus_read_block_data(struct i2c_client *client, u8 command, u8 *values);
+s32 i2c_smbus_write_block_data(struct i2c_client *client, u8 command, 
+                                u8 length, const u8 *values);
+
+/* 原始 I2C 傳輸 */
+int i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num);
+
+/* 使用 i2c_transfer 讀取多個 bytes */
+static int my_read_regs(struct i2c_client *client, u8 reg, u8 *buf, int len)
+{
+    struct i2c_msg msgs[2] = {
+        {
+            .addr = client->addr,
+            .flags = 0,           /* 寫 */
+            .len = 1,
+            .buf = &reg,
+        },
+        {
+            .addr = client->addr,
+            .flags = I2C_M_RD,    /* 讀 */
+            .len = len,
+            .buf = buf,
+        },
+    };
+    
+    int ret = i2c_transfer(client->adapter, msgs, 2);
+    if (ret != 2)
+        return ret < 0 ? ret : -EIO;
+    
+    return 0;
+}
+```
+
+---
+
+## 🔷 Linux Kernel SPI Subsystem 架構
+
+### SPI Subsystem 核心結構
+
+```c
+/* include/linux/spi/spi.h */
+
+/*
+ * SPI Subsystem 架構：
+ *
+ *  ┌─────────────────────────────────────────────────────┐
+ *  │                    Application                       │
+ *  │               (read/write /dev/spidevN.M)            │
+ *  └────────────────────────┬────────────────────────────┘
+ *                           ↓
+ *  ┌─────────────────────────────────────────────────────┐
+ *  │                 SPI Core (spi.c)                     │
+ *  │     • spi_sync() / spi_async()                       │
+ *  │     • Device/Driver 匹配                              │
+ *  └────────────────────────┬────────────────────────────┘
+ *                           ↓
+ *  ┌─────────────────────────────────────────────────────┐
+ *  │              SPI Controller (spi_controller)        │
+ *  │     • 代表 SPI Master 硬體                           │
+ *  │     • 實作 transfer_one() 進行實際傳輸              │
+ *  └────────────────────────┬────────────────────────────┘
+ *                           ↓
+ *  ┌─────────────────────────────────────────────────────┐
+ *  │                  SPI Hardware                        │
+ *  │            (SoC SPI Controller)                      │
+ *  └─────────────────────────────────────────────────────┘
+ */
+
+/* SPI Controller (舊稱 spi_master) */
+struct spi_controller {
+    struct device dev;
+    
+    u16 bus_num;                      /* Controller 編號 */
+    u16 num_chipselect;               /* 支援的 CS 數量 */
+    
+    /* 設定 SPI Mode */
+    int (*setup)(struct spi_device *spi);
+    
+    /* 傳輸 */
+    int (*transfer)(struct spi_device *spi, struct spi_message *mesg);
+    int (*transfer_one)(struct spi_controller *ctlr, struct spi_device *spi,
+                        struct spi_transfer *xfer);
+    
+    /* DMA 支援 */
+    bool (*can_dma)(struct spi_controller *ctlr, struct spi_device *spi,
+                    struct spi_transfer *xfer);
+    
+    /* Chip Select 控制 */
+    void (*set_cs)(struct spi_device *spi, bool enable);
+    
+    /* ... */
+};
+
+/* SPI Device (從設備) */
+struct spi_device {
+    struct device dev;
+    struct spi_controller *controller;
+    
+    u32 max_speed_hz;                 /* 最大時脈 */
+    u8 chip_select;                   /* CS 編號 */
+    u8 bits_per_word;                 /* 每字位數 (8, 16...) */
+    u32 mode;                         /* SPI Mode (CPOL, CPHA) */
+    
+    int irq;                          /* 中斷號碼 */
+    
+    /* ... */
+};
+
+/* SPI Driver */
+struct spi_driver {
+    int (*probe)(struct spi_device *spi);
+    void (*remove)(struct spi_device *spi);
+    void (*shutdown)(struct spi_device *spi);
+    
+    struct device_driver driver;
+    const struct spi_device_id *id_table;
+};
+```
+
+### SPI 傳輸結構
+
+```c
+/* 單一傳輸操作 */
+struct spi_transfer {
+    const void *tx_buf;              /* 發送緩衝區 */
+    void *rx_buf;                    /* 接收緩衝區 */
+    unsigned len;                    /* 傳輸長度 */
+    
+    dma_addr_t tx_dma;               /* TX DMA 地址 */
+    dma_addr_t rx_dma;               /* RX DMA 地址 */
+    
+    unsigned cs_change:1;            /* 傳輸後是否切換 CS */
+    unsigned tx_nbits:3;             /* 幾線 TX (1/2/4) */
+    unsigned rx_nbits:3;             /* 幾線 RX (1/2/4) */
+    
+    u32 speed_hz;                    /* 此次傳輸的時脈 */
+    u16 delay_usecs;                 /* 傳輸後延遲 */
+    
+    struct list_head transfer_list;
+};
+
+/* 完整的 SPI 傳輸訊息 */
+struct spi_message {
+    struct list_head transfers;      /* spi_transfer 列表 */
+    struct spi_device *spi;
+    
+    unsigned is_dma_mapped:1;        /* 是否已 DMA 映射 */
+    
+    /* 完成回調 */
+    void (*complete)(void *context);
+    void *context;
+    
+    int status;                      /* 傳輸結果 */
+    unsigned actual_length;          /* 實際傳輸長度 */
+};
+```
+
+### SPI Flash Driver 範例
+
+```c
+/* SPI Flash (例如 W25Q64) Driver 範例 */
+
+#include <linux/spi/spi.h>
+#include <linux/mtd/mtd.h>
+#include <linux/mtd/partitions.h>
+
+#define CMD_READ_ID     0x9F
+#define CMD_READ_DATA   0x03
+#define CMD_PAGE_PROG   0x02
+#define CMD_SECTOR_ERASE 0x20
+#define CMD_WRITE_EN    0x06
+#define CMD_READ_STATUS 0x05
+
+struct w25q_flash {
+    struct spi_device *spi;
+    struct mtd_info mtd;
+    struct mutex lock;
+};
+
+/* 讀取 JEDEC ID */
+static int w25q_read_id(struct w25q_flash *flash, u32 *id)
+{
+    u8 cmd = CMD_READ_ID;
+    u8 buf[3];
+    int ret;
+    
+    ret = spi_write_then_read(flash->spi, &cmd, 1, buf, 3);
+    if (ret)
+        return ret;
+    
+    *id = (buf[0] << 16) | (buf[1] << 8) | buf[2];
+    return 0;
+}
+
+/* 讀取資料 */
+static int w25q_read(struct w25q_flash *flash, u32 addr, 
+                     u8 *buf, size_t len)
+{
+    u8 cmd[4];
+    struct spi_transfer xfers[2] = { };
+    struct spi_message msg;
+    int ret;
+    
+    cmd[0] = CMD_READ_DATA;
+    cmd[1] = (addr >> 16) & 0xFF;
+    cmd[2] = (addr >> 8) & 0xFF;
+    cmd[3] = addr & 0xFF;
+    
+    spi_message_init(&msg);
+    
+    /* 第一個 transfer: 發送命令 + 地址 */
+    xfers[0].tx_buf = cmd;
+    xfers[0].len = 4;
+    spi_message_add_tail(&xfers[0], &msg);
+    
+    /* 第二個 transfer: 接收資料 */
+    xfers[1].rx_buf = buf;
+    xfers[1].len = len;
+    spi_message_add_tail(&xfers[1], &msg);
+    
+    mutex_lock(&flash->lock);
+    ret = spi_sync(flash->spi, &msg);
+    mutex_unlock(&flash->lock);
+    
+    return ret;
+}
+
+/* Probe 函式 */
+static int w25q_probe(struct spi_device *spi)
+{
+    struct w25q_flash *flash;
+    u32 id;
+    int ret;
+    
+    flash = devm_kzalloc(&spi->dev, sizeof(*flash), GFP_KERNEL);
+    if (!flash)
+        return -ENOMEM;
+    
+    flash->spi = spi;
+    mutex_init(&flash->lock);
+    
+    spi_set_drvdata(spi, flash);
+    
+    /* 設定 SPI Mode */
+    spi->mode = SPI_MODE_0;
+    spi->bits_per_word = 8;
+    ret = spi_setup(spi);
+    if (ret)
+        return ret;
+    
+    /* 讀取 ID 確認裝置 */
+    ret = w25q_read_id(flash, &id);
+    if (ret)
+        return ret;
+    
+    dev_info(&spi->dev, "W25Q Flash detected, JEDEC ID: 0x%06X\n", id);
+    
+    return 0;
+}
+
+static const struct of_device_id w25q_of_match[] = {
+    { .compatible = "winbond,w25q64" },
+    { }
+};
+MODULE_DEVICE_TABLE(of, w25q_of_match);
+
+static struct spi_driver w25q_driver = {
+    .driver = {
+        .name = "w25q64",
+        .of_match_table = w25q_of_match,
+    },
+    .probe = w25q_probe,
+};
+module_spi_driver(w25q_driver);
+```
+
+### SPI DMA 傳輸
+
+```c
+/* 對於大量資料傳輸，使用 DMA 可提高效能 */
+
+static int my_spi_dma_transfer(struct spi_device *spi, 
+                               void *tx, void *rx, size_t len)
+{
+    struct spi_transfer xfer = {
+        .tx_buf = tx,
+        .rx_buf = rx,
+        .len = len,
+        /* 如果 controller 支援 DMA，會自動使用 */
+    };
+    
+    return spi_sync_transfer(spi, &xfer, 1);
+}
+
+/* Controller 端設定 DMA Threshold */
+static bool my_spi_can_dma(struct spi_controller *ctlr,
+                           struct spi_device *spi,
+                           struct spi_transfer *xfer)
+{
+    /* 只有當傳輸長度超過 threshold 時才使用 DMA */
+    return xfer->len >= 256;
+}
+```
+
+---
+
+## 🔷 Linux Kernel UART/TTY Subsystem 架構
+
+### TTY Subsystem 概述
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Linux TTY Subsystem 架構                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   Application                                                            │
+│       ↓ open("/dev/ttyS0")                                               │
+│   ┌──────────────────────────────────────────────────────────────┐      │
+│   │                     TTY Core                                  │      │
+│   │   • /dev/ttyS*, /dev/ttyUSB*, /dev/ttyAMA*                   │      │
+│   │   • Line Discipline (N_TTY, PPP, SLIP...)                    │      │
+│   └──────────────────────────┬───────────────────────────────────┘      │
+│                              ↓                                           │
+│   ┌──────────────────────────────────────────────────────────────┐      │
+│   │                    TTY Driver                                 │      │
+│   │   • tty_operations (open, close, write, ioctl...)            │      │
+│   └──────────────────────────┬───────────────────────────────────┘      │
+│                              ↓                                           │
+│   ┌──────────────────────────────────────────────────────────────┐      │
+│   │                  Serial Core                                  │      │
+│   │   • uart_driver / uart_port                                   │      │
+│   │   • uart_ops (start_tx, stop_tx, tx_empty...)                │      │
+│   └──────────────────────────┬───────────────────────────────────┘      │
+│                              ↓                                           │
+│   ┌──────────────────────────────────────────────────────────────┐      │
+│   │                UART Hardware                                  │      │
+│   │            (SoC UART Controller)                              │      │
+│   └──────────────────────────────────────────────────────────────┘      │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Serial Core 核心結構
+
+```c
+/* include/linux/serial_core.h */
+
+/* UART Driver - 代表一類 UART (例如 8250 系列) */
+struct uart_driver {
+    struct module *owner;
+    const char *driver_name;         /* "serial" */
+    const char *dev_name;            /* "ttyS" */
+    int major;                       /* 主裝置號 */
+    int minor;                       /* 起始次裝置號 */
+    int nr;                          /* 最大 port 數量 */
+    
+    struct console *cons;            /* Console 指標 */
+    
+    /* ... */
+};
+
+/* UART Port - 代表一個 UART */
+struct uart_port {
+    spinlock_t lock;
+    unsigned long iobase;            /* I/O port base */
+    unsigned char __iomem *membase;  /* Memory mapped base */
+    unsigned int irq;                /* IRQ 號碼 */
+    
+    unsigned int uartclk;            /* UART clock */
+    unsigned int fifosize;           /* FIFO 大小 */
+    unsigned char x_char;            /* XON/XOFF 字元 */
+    unsigned char regshift;          /* 暫存器偏移 */
+    
+    unsigned int line;               /* Port 編號 */
+    unsigned int type;               /* PORT_16550A 等 */
+    
+    const struct uart_ops *ops;      /* 操作函式 */
+    
+    struct device *dev;
+    
+    /* ... */
+};
+
+/* UART 操作函式 */
+struct uart_ops {
+    unsigned int (*tx_empty)(struct uart_port *port);
+    void (*set_mctrl)(struct uart_port *port, unsigned int mctrl);
+    unsigned int (*get_mctrl)(struct uart_port *port);
+    void (*stop_tx)(struct uart_port *port);
+    void (*start_tx)(struct uart_port *port);
+    void (*stop_rx)(struct uart_port *port);
+    void (*break_ctl)(struct uart_port *port, int ctl);
+    int (*startup)(struct uart_port *port);
+    void (*shutdown)(struct uart_port *port);
+    void (*set_termios)(struct uart_port *port, struct ktermios *new,
+                        const struct ktermios *old);
+    /* ... */
+};
+```
+
+### 簡單 UART Driver 範例
+
+```c
+/* 極簡 UART Driver 框架 */
+
+#include <linux/serial_core.h>
+#include <linux/platform_device.h>
+
+#define MY_UART_NR   4
+
+static struct uart_driver my_uart_driver = {
+    .owner      = THIS_MODULE,
+    .driver_name = "my_uart",
+    .dev_name   = "ttyMY",
+    .major      = 0,  /* 動態分配 */
+    .minor      = 0,
+    .nr         = MY_UART_NR,
+};
+
+static unsigned int my_uart_tx_empty(struct uart_port *port)
+{
+    /* 檢查 TX FIFO 是否為空 */
+    u32 status = readl(port->membase + REG_STATUS);
+    return (status & TX_EMPTY) ? TIOCSER_TEMT : 0;
+}
+
+static void my_uart_start_tx(struct uart_port *port)
+{
+    /* 啟動發送 */
+    u32 ctrl = readl(port->membase + REG_CTRL);
+    ctrl |= TX_ENABLE;
+    writel(ctrl, port->membase + REG_CTRL);
+}
+
+static void my_uart_stop_tx(struct uart_port *port)
+{
+    /* 停止發送 */
+    u32 ctrl = readl(port->membase + REG_CTRL);
+    ctrl &= ~TX_ENABLE;
+    writel(ctrl, port->membase + REG_CTRL);
+}
+
+static int my_uart_startup(struct uart_port *port)
+{
+    /* Port 啟動初始化 */
+    /* 請求中斷、啟用 RX 等 */
+    return 0;
+}
+
+static void my_uart_shutdown(struct uart_port *port)
+{
+    /* Port 關閉清理 */
+}
+
+static void my_uart_set_termios(struct uart_port *port,
+                                struct ktermios *new,
+                                const struct ktermios *old)
+{
+    unsigned int baud;
+    
+    /* 計算 baud rate */
+    baud = uart_get_baud_rate(port, new, old, 9600, 4000000);
+    
+    /* 設定硬體 baud rate */
+    writel(port->uartclk / (16 * baud), port->membase + REG_BAUD);
+    
+    /* 設定其他參數 (data bits, parity, stop bits) */
+}
+
+static const struct uart_ops my_uart_ops = {
+    .tx_empty     = my_uart_tx_empty,
+    .start_tx     = my_uart_start_tx,
+    .stop_tx      = my_uart_stop_tx,
+    .startup      = my_uart_startup,
+    .shutdown     = my_uart_shutdown,
+    .set_termios  = my_uart_set_termios,
+    /* ... */
+};
+
+static int my_uart_probe(struct platform_device *pdev)
+{
+    struct uart_port *port;
+    struct resource *res;
+    int ret;
+    
+    port = devm_kzalloc(&pdev->dev, sizeof(*port), GFP_KERNEL);
+    if (!port)
+        return -ENOMEM;
+    
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    port->membase = devm_ioremap_resource(&pdev->dev, res);
+    if (IS_ERR(port->membase))
+        return PTR_ERR(port->membase);
+    
+    port->irq = platform_get_irq(pdev, 0);
+    port->ops = &my_uart_ops;
+    port->dev = &pdev->dev;
+    port->type = PORT_16550A;
+    port->line = pdev->id;
+    
+    ret = uart_add_one_port(&my_uart_driver, port);
+    if (ret)
+        return ret;
+    
+    platform_set_drvdata(pdev, port);
+    
+    return 0;
+}
+```
+
+---
+
+## 📝 進階面試題庫
+
+### Q1: i2c_smbus_read_byte_data 和 i2c_transfer 的區別？
+
+**難度**：⭐⭐⭐⭐
+**常見於**：NVIDIA / 聯發科
+
+**答案**：
+
+```c
+/* i2c_smbus_* 系列 */
+/* - 高階 API，封裝 SMBus 協定 */
+/* - 較常用，支援大部分 I2C 裝置 */
+/* - 自動處理 Start/Stop/ACK */
+
+s32 val = i2c_smbus_read_byte_data(client, 0x10);
+/* 相當於：S - Addr+W - 0x10 - Sr - Addr+R - [data] - P */
+
+/* i2c_transfer */
+/* - 低階 API，完全控制傳輸序列 */
+/* - 可以自訂複雜的傳輸模式 */
+/* - 需要自己組裝 i2c_msg */
+
+struct i2c_msg msgs[2];
+u8 reg = 0x10;
+u8 data;
+
+msgs[0].addr = client->addr;
+msgs[0].flags = 0;
+msgs[0].len = 1;
+msgs[0].buf = &reg;
+
+msgs[1].addr = client->addr;
+msgs[1].flags = I2C_M_RD;
+msgs[1].len = 1;
+msgs[1].buf = &data;
+
+i2c_transfer(client->adapter, msgs, 2);
+```
+
+**何時用 i2c_transfer**：
+- 需要連續傳輸多個 bytes 到不同暫存器
+- 需要特殊的傳輸序列
+- 裝置不符合標準 SMBus 協定
+
+---
+
+### Q2: SPI 的 spi_sync 和 spi_async 區別？
+
+**難度**：⭐⭐⭐⭐
+**常見於**：普遍
+
+**答案**：
+
+```c
+/* spi_sync - 同步傳輸 */
+/* - 阻塞直到傳輸完成 */
+/* - 簡單易用 */
+/* - 不能在 interrupt context 使用 */
+
+ret = spi_sync(spi, &msg);
+/* 這裡傳輸已完成 */
+if (ret == 0) {
+    /* 成功，可以使用 rx_buf 中的資料 */
+}
+
+/* spi_async - 非同步傳輸 */
+/* - 立即返回，不等待完成 */
+/* - 透過 callback 通知完成 */
+/* - 可以在 interrupt context 使用 */
+
+static void my_complete(void *ctx)
+{
+    struct my_data *data = ctx;
+    /* 傳輸完成，處理 rx_buf */
+    complete(&data->done);
+}
+
+msg.complete = my_complete;
+msg.context = data;
+
+ret = spi_async(spi, &msg);
+/* 立即返回，傳輸可能還在進行 */
+
+wait_for_completion(&data->done);
+/* 現在傳輸完成了 */
+```
+
+---
+
+### Q3: I2C Bus Recovery 是什麼？如何實現？
+
+**難度**：⭐⭐⭐⭐⭐
+**常見於**：NVIDIA / 硬體相關職位
+
+**答案**：
+
+當 I2C Slave 裝置卡住（例如中途斷電），SDA 可能被拉低，導致 Bus 無法使用。
+
+**Recovery 方法**：
+```c
+/* 標準方法：發送 9 個 Clock Pulse */
+/* Slave 看到 9 個 clock 後會釋放 SDA */
+
+static int i2c_recover_bus(struct i2c_adapter *adap)
+{
+    int i;
+    
+    /* 1. 確認 SDA 是低電位 (Bus stuck) */
+    if (gpio_get_value(sda_gpio))
+        return 0;  /* SDA 是高，Bus 正常 */
+    
+    /* 2. 發送 9 個 Clock */
+    for (i = 0; i < 9; i++) {
+        gpio_set_value(scl_gpio, 1);
+        udelay(5);
+        gpio_set_value(scl_gpio, 0);
+        udelay(5);
+    }
+    
+    /* 3. 發送 STOP 條件 */
+    gpio_set_value(sda_gpio, 0);
+    udelay(5);
+    gpio_set_value(scl_gpio, 1);
+    udelay(5);
+    gpio_set_value(sda_gpio, 1);  /* SDA 從 0 變 1 */
+    
+    /* 4. 檢查是否恢復 */
+    if (!gpio_get_value(sda_gpio)) {
+        dev_err(&adap->dev, "Bus recovery failed\n");
+        return -EIO;
+    }
+    
+    return 0;
+}
+
+/* Linux Kernel 內建支援 */
+static const struct i2c_bus_recovery_info my_recovery = {
+    .recover_bus = i2c_generic_scl_recovery,
+    .get_scl = my_get_scl,
+    .set_scl = my_set_scl,
+    .get_sda = my_get_sda,
+    .set_sda = my_set_sda,
+};
+
+adap->bus_recovery_info = &my_recovery;
+```
+
+---
+
+### Q4: UART 的 termios 結構是什麼？
+
+**難度**：⭐⭐⭐⭐
+**常見於**：普遍
+
+**答案**：
+
+`termios` 是用來設定終端機/串列埠參數的結構。
+
+```c
+/* include/uapi/asm-generic/termbits.h */
+
+struct termios {
+    tcflag_t c_iflag;   /* 輸入模式 */
+    tcflag_t c_oflag;   /* 輸出模式 */
+    tcflag_t c_cflag;   /* 控制模式 */
+    tcflag_t c_lflag;   /* 本地模式 */
+    cc_t c_cc[NCCS];    /* 特殊字元 */
+};
+
+/* 常用的 c_cflag 設定 */
+#define CSIZE    000000060   /* 資料位數遮罩 */
+#define   CS5    000000000   /* 5 bits */
+#define   CS6    000000020   /* 6 bits */
+#define   CS7    000000040   /* 7 bits */
+#define   CS8    000000060   /* 8 bits */
+#define CSTOPB   000000100   /* 2 stop bits */
+#define CREAD    000000200   /* 啟用接收 */
+#define PARENB   000000400   /* 啟用 parity */
+#define PARODD   000001000   /* 奇數 parity */
+#define CLOCAL   000004000   /* 忽略 modem 控制線 */
+#define CRTSCTS  020000000   /* 硬體流控 */
+
+/* 設定 115200 8N1 */
+struct termios tio;
+tcgetattr(fd, &tio);
+
+tio.c_cflag &= ~CSIZE;
+tio.c_cflag |= CS8;        /* 8 bits */
+tio.c_cflag &= ~PARENB;    /* No parity */
+tio.c_cflag &= ~CSTOPB;    /* 1 stop bit */
+
+cfsetispeed(&tio, B115200);
+cfsetospeed(&tio, B115200);
+
+tcsetattr(fd, TCSANOW, &tio);
+```
+
+---
+
+### Q5: 如何在 Driver 中處理 I2C NACK？
+
+**難度**：⭐⭐⭐⭐
+**常見於**：普遍
+
+**答案**：
+
+```c
+/* I2C 傳輸可能因為 NACK 而失敗 */
+
+static int my_read_reg(struct i2c_client *client, u8 reg, u8 *val)
+{
+    int ret;
+    int retries = 3;
+    
+    do {
+        ret = i2c_smbus_read_byte_data(client, reg);
+        if (ret >= 0) {
+            *val = ret;
+            return 0;
+        }
+        
+        /* 常見錯誤碼 */
+        switch (ret) {
+        case -ENXIO:     /* No ACK received (裝置不存在) */
+            dev_dbg(&client->dev, "Device not responding\n");
+            break;
+        case -EIO:       /* I/O error */
+            dev_dbg(&client->dev, "I2C I/O error\n");
+            break;
+        case -ETIMEDOUT: /* 超時 */
+            dev_dbg(&client->dev, "I2C timeout\n");
+            break;
+        }
+        
+        msleep(10);  /* 等待後重試 */
+        
+    } while (--retries > 0);
+    
+    dev_err(&client->dev, "I2C read failed after retries: %d\n", ret);
+    return ret;
+}
+
+/* 檢測裝置是否存在 */
+static bool my_device_present(struct i2c_client *client)
+{
+    int ret;
+    
+    /* 發送一個 Quick Command */
+    ret = i2c_smbus_quick(client, I2C_SMBUS_READ);
+    
+    return (ret == 0);
+}
+```
+
+---
+
+### Q6: SPI 的四種 Mode (0-3) 差異？
+
+**難度**：⭐⭐⭐
+**常見於**：基礎題
+
+**答案**：
+
+```
+SPI Mode = CPOL + CPHA
+
+CPOL (Clock Polarity): 閒置時 SCK 電位
+CPHA (Clock Phase): 資料取樣時機
+
+┌──────┬──────┬──────┬─────────────────────────────────────────┐
+│ Mode │ CPOL │ CPHA │                  說明                    │
+├──────┼──────┼──────┼─────────────────────────────────────────┤
+│  0   │  0   │  0   │ 閒置時 SCK=0，第一個邊沿取樣（上升沿）    │
+│  1   │  0   │  1   │ 閒置時 SCK=0，第二個邊沿取樣（下降沿）    │
+│  2   │  1   │  0   │ 閒置時 SCK=1，第一個邊沿取樣（下降沿）    │
+│  3   │  1   │  1   │ 閒置時 SCK=1，第二個邊沿取樣（上升沿）    │
+└──────┴──────┴──────┴─────────────────────────────────────────┘
+
+時序圖 (Mode 0):
+
+SCK:  _____|‾‾‾‾‾|_____|‾‾‾‾‾|_____|‾‾‾‾‾|_____
+          ↑           ↑           ↑
+         取樣         取樣         取樣
+
+時序圖 (Mode 3):
+
+SCK:  ‾‾‾‾‾|_____|‾‾‾‾‾|_____|‾‾‾‾‾|_____|‾‾‾‾‾
+                 ↑           ↑           ↑
+                取樣         取樣         取樣
+```
+
+**設定方法**：
+```c
+spi->mode = SPI_MODE_0;  /* CPOL=0, CPHA=0 */
+spi->mode = SPI_MODE_3;  /* CPOL=1, CPHA=1 */
+spi_setup(spi);
+```
+
+---
+
+## 📚 延伸閱讀
+
+1. **Linux Kernel 文件**
+   - Documentation/i2c/
+   - Documentation/spi/
+   - Documentation/serial/
+
+2. **Kernel Source**
+   - drivers/i2c/
+   - drivers/spi/
+   - drivers/tty/serial/
+
+3. **書籍**
+   - Linux Device Drivers, 3rd Edition
+   - Understanding the Linux Kernel
+
+4. **線上資源**
+   - [Bootlin I2C Training](https://bootlin.com/doc/training/linux-kernel/)
+   - [SPI Tutorial](https://www.analog.com/en/analog-dialogue/articles/introduction-to-spi-interface.html)
