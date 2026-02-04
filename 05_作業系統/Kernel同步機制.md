@@ -1162,6 +1162,84 @@ rt_mutex_unlock(&my_rtmutex);
 
 ---
 
+## 🔷 第八部分：Hardware Synchronization (Memory Barrier)
+
+這是寫 Driver 中最容易寫錯，也最常被高階主管問倒的題材。
+
+### 8.1 為什麼需要 Memory Barrier？
+
+現代 CPU 為了效能，會做**亂序執行 (Out-of-Order Execution)**。編譯器 (Compiler) 也會為了優化而**重排指令 (Reordering)**。
+
+```c
+/* 情境：通知 Device 開始工作 */
+/* 
+ * 預期順序：
+ * 1. 填寫 DMA Descriptor (Data)
+ * 2. 寫入 Doorbell Register (Trigger)
+ */
+
+desc->addr = dma_addr;
+desc->len = 1024;
+desc->valid = 1;
+/* <-- 這裡如果沒有 Barrier --> */
+writel(0x1, DOORBELL_REG);
+
+/*
+ * 問題：
+ * CPU 或 Compiler 可能覺得這幾行沒有相依性，於是先把 writel 執行了！
+ * 結果：Device 收到通知去讀 Descriptor，但 valid bit 還沒設為 1，導致錯誤。
+ */
+```
+
+### 8.2 Barrier 種類
+
+1.  **Compiler Barrier**：只阻止編譯器重排，不影響 CPU。
+    -   `barrier()`: `asm volatile("" ::: "memory")`
+    -   所有 `READ_ONCE()`, `WRITE_ONCE()`
+
+2.  **CPU Memory Barrier**：阻止 CPU 重排。
+    -   `mb()`: Full memory barrier (Read+Write)
+    -   `rmb()`: Read memory barrier (Read only)
+    -   `wmb()`: Write memory barrier (Write only)
+    -   `smp_mb()`: 僅在 SMP 系統有效
+
+3.  **ARM64 專用指令**：
+    -   `dmb` (Data Memory Barrier): 確保記憶體存取順序，但不暫停管線。
+    -   `dsb` (Data Synchronization Barrier): 等待前面的存取完全完成。
+    -   `isb` (Instruction Synchronization Barrier): 清空 Pipeline，重新 fetch 指令。
+
+### 8.3 實戰：Driver 中的 Barrier
+
+```c
+/* 正確寫法 */
+
+/* 1. 填寫資料 */
+desc->addr = dma_addr;
+desc->len = 1024;
+
+/* 2. Write Memory Barrier */
+/* 確保資料都寫入 DRAM 後，才執行後面的寫入 */
+wmb(); 
+
+/* 3. 更新 Valid bit */
+desc->valid = 1;
+
+/* 4. Write Memory Barrier for IO */
+/* writel 內部通常自帶 barrier，但在某些架構仍需注意 */
+wmb();
+
+/* 5. 通周 Device 啟動 */
+writel(0x1, DOORBELL_REG);
+```
+
+**口訣**：
+- **寫後寫 (Write-after-Write)** 用 `wmb()`。
+- **讀後讀 (Read-after-Read)** 用 `rmb()`。
+- **讀後寫 / 寫後讀** 用 `mb()`。
+- **Writel/Readl** 通常對 Device Memory 有隱含的順序保證，但對 Normal Memory (DMA Buffer) 則無，混合存取時必須加 Barrier。
+
+---
+
 ## 📚 延伸閱讀
 
 1. **Linux Kernel Development** - Robert Love (Chapter 8-9)

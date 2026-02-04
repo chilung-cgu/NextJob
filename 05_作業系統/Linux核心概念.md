@@ -1547,6 +1547,85 @@ static int my_remove(struct platform_device *pdev)
 
 ---
 
+## 🔷 第八部分：深入核心機制 (Tier 1 必考)
+
+### 8.1 ARM64 System Call 完整路徑
+
+當 User Space 程式呼叫 `read()` 時，到底發生了什麼？這題能展現你對 Computer Architecture 和 OS 互動的深度理解。
+
+```
+User Space:
+  1. app 呼叫 read() (glibc wrapper)
+  2. glibc 將 system call number (如 63) 放入 x8 register
+  3. glibc 執行 `svc #0` (Supervisor Call) 指令
+       ↓
+       ↓ (Exception Level switch: EL0 -> EL1)
+       ↓
+Kernel Space (ARM64):
+  4. 觸發 Synchronous Exception
+  5. CPU 跳轉到 Vector Table (arch/arm64/kernel/entry.S)
+  6. 執行 `el0_sync` (處理來自 EL0 的同步異常)
+  7. 執行 `el0_svc`
+  8. 查表 `sys_call_table` (依據 x8 register 的 index)
+  9. 執行 `sys_read()` (fs/read_write.c)
+       ↓
+  10. 執行實際的 VFS 讀取操作
+       ↓
+  11. `ret_to_user` (恢復 User Space Context)
+       ↓ (ERET 指令)
+User Space:
+  12. read() 返回
+```
+
+**關鍵面試點**：
+- **Context Saving**：進入 Kernel 時，必須保存 User Space 的暫存器 (x0-x30, sp, pc, pstate) 到 `pt_regs` 結構中 (位於 Kernel Stack)。
+- **Table Lookup**：`sys_call_table` 是一個函式指標陣列。
+- **Security**：Kernel 必須驗證 User 傳入的 Buffer 指標是否合法 (`access_ok`)，防止 User 騙 Kernel 去讀寫 Kernel Memory。
+
+### 8.2 SMP (Symmetric Multi-Processing) 啟動流程
+
+多核心 CPU 是如何一顆一顆被叫醒的？
+通常系統上電時，只有 **Boot CPU (CPU 0)** 會執行，其他 **Secondary CPUs** 處於深層睡眠 (Power off / WFE)。
+
+```
+1. Boot CPU (CPU 0) 執行:
+   start_kernel()
+     ↓
+   rest_init()
+     ↓
+   kernel_init()
+     ↓
+   smp_init()  (開始叫醒其他人)
+     ↓
+   for_each_present_cpu(cpu):
+       cpu_up(cpu)
+         ↓
+       __cpu_up(cpu)
+         ↓
+       PSCI (Power State Coordination Interface) Call
+         (透過 SMC 指令呼叫 ATF/TF-A)
+
+2. ATF (EL3) 收到請求:
+   - 開啟目標 CPU 的電源
+   - 設定目標 CPU 的 Reset Vector 指向 Kernel 的 `secondary_startup`
+
+3. Secondary CPU (CPU N) 醒來:
+   secondary_startup (arch/arm64/kernel/head.S)
+     ↓
+   __cpu_setup (初始化 MMU 等)
+     ↓
+   secondary_start_kernel()
+     ↓
+   cpu_startup_entry()
+     ↓
+   進入 Idle Loop，等待排程
+```
+
+**關鍵技術**：**PSCI (Power State Coordination Interface)**。
+在 ARMv8，Kernel 不能直接寫暫存器把 CPU 開機 (因為那是 Secure World 的權限)，必須呼叫與 Firmware (ATF) 定義好的標準介面 (PSCI)。
+
+---
+
 ## ✅ 章節完成報告
 
 - 檔案：`/05_作業系統/Linux核心概念.md`
