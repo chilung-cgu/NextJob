@@ -12,6 +12,13 @@ Applies to: All `.md` files, especially interview prep and technical documentati
 - **Action**: If a table is inside code blocks, remove the backticks so it renders as a rich table.
 - **Conversion**: If you see an ASCII art table (using `+`, `-`, `|` manually drawn), convert it to a standard Markdown table unless it is a complex diagram that cannot be represented by a grid.
 - **Alignment**: Use `:---` for left align, `:---:` for center, `---:` for right. Default to left for text.
+- **Indentation in Lists**: If a table is part of a list item (e.g., inside an ordered or bulleted list), the table **MUST be indented** to match the list item's content indentation (typically 3 or 4 spaces). Without indentation, the list hierarchy breaks, and the table may not render correctly in previews.
+  ```markdown
+  1. Item 1
+     | Column A | Column B |  <- Indented
+     | :---     | :---     |
+     | Data     | Data     |
+  ```
 
 ## 2. Lists and Hierarchy
 - **Rule**: Nested lists must use proper indentation to be rendered correctly as sub-items.
