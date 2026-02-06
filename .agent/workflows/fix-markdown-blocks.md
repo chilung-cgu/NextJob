@@ -1,3 +1,7 @@
+---
+description: 此 Workflow 用於依照 `markdown-polishing` Skill 的標準，全面優化 `.md` 文件的格式。不僅修復程式碼區塊錯誤，還包含表格、列表與問答格式的標準化。
+---
+
 # Polish Markdown Workflow (Previously Fix Markdown Blocks)
 
 此 Workflow 用於依照 `markdown-polishing` Skill 的標準，全面優化 `.md` 文件的格式。不僅修復程式碼區塊錯誤，還包含表格、列表與問答格式的標準化。
