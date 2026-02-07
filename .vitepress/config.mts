@@ -47,7 +47,7 @@ export default defineConfig({
       { text: '驅動開發', link: '/03_底層驅動開發/I2C_SPI_UART' },
       { text: 'OpenBMC', link: '/04_OpenBMC深化/架構複習' },
       { text: 'OS', link: '/05_作業系統/Bootloader' },
-      { text: '面試', link: '/06_面試準備/履歷範本' },
+      { text: '面試', link: '/06_面試準備/外商履歷_撰寫指南' },
       { text: '專案', link: '/07_練習專案/專案清單' }
     ],
 

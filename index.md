@@ -31,5 +31,5 @@ features:
     link: /05_作業系統/Bootloader
   - title: 面試準備
     details: 模擬面試問答、履歷撰寫與公司研究。
-    link: /06_面試準備/履歷範本
+    link: /06_面試準備/外商履歷_撰寫指南
 ---

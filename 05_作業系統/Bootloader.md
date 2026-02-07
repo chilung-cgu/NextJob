@@ -22,27 +22,30 @@
 系統啟動是一場接力賽，每一棒的功能越來越強，但也越來越慢。
 
 ```text
-Capacity:   [~64KB SRAM]      [~128KB SRAM]      [GBs DRAM]
-Complexity: [Hardcoded]       [Minimal Driver]   [Full Driver]
-              │                 │                  │
-              ▼                 ▼                  ▼
-          ┌────────┐        ┌────────┐        ┌────────┐        ┌────────┐
-Power On: │ BootROM│───────▶│   SPL  │───────▶│ U-Boot │───────▶│ Linux  │
-          └────────┘        └────────┘        └────────┘        └────────┘
-Target:   Initialize        Initialize        Load Kernel       Mount RootFS
-          Basic HW          DRAM & Clocks     Net/USB/Disk      Run Services
+Capacity:   [~64KB SRAM]      [~128KB SRAM]      [Secure RAM]      [GBs DRAM]
+Complexity: [Hardcoded]       [Minimal Driver]   [Secure Mon]      [Full Driver]
+              │                 │                  │                 │
+              ▼                 ▼                  ▼                 ▼
+          ┌────────┐        ┌────────┐        ┌─────────┐       ┌─────────────┐        ┌────────┐
+Power On: │ BootROM│───────▶│   SPL  │───────▶│ ATF/TEE │──────▶│ U-Boot Proper│───────▶│ Linux  │
+          └────────┘        └────────┘        └─────────┘       └─────────────┘        └────────┘
+                                               (ARMv8/Opt)
+
+Target:   Initialize        Initialize        Secure Monitor    Load Kernel             Mount RootFS
+          Basic HW          DRAM & Clocks     (EL3 Runtime)     Net/USB/Disk            Run Services
 ```
 
 ### 2. 信任鏈 (Chain of Trust)
 
 Secure Boot 就像海關檢查。每一站都要檢查下一站的護照 (簽章)。
 -   **Root of Trust**: 晶片裡的 OTP 公鑰 (不可修改)。
--   **Chain**: ROM 驗 SPL -> SPL 驗 U-Boot -> U-Boot 驗 Kernel (FIT Image)。
+-   **Chain**: ROM 驗 SPL -> SPL 驗 U-Boot Proper -> U-Boot Proper 驗 Kernel (FIT Image)。
 -   任何一環失敗，系統直接停機 (Panic)。
 
 ---
 
-## 🔷 Logic I: 標準開機流程 (ARM AST2600 為例)
+## 🔷 Logic I: 標準開機流程 (以 ARMv7 AST2600 為例)
+> **Note**: AST2600 是 32-bit ARMv7 架構，通常不執行完整的 ATF (BL31)，而是直接由 SPL 跳轉到 U-Boot Proper (或經由 OpTEE)。
 
 ### 1. Stage 0: Boot ROM
 -   **位置**: SoC 內部唯讀記憶體 (出廠燒死)。
@@ -56,10 +59,11 @@ Secure Boot 就像海關檢查。每一站都要檢查下一站的護照 (簽章
 -   **任務**:
     1.  **DRAM 初始化** (最重要！)。在此之前 DRAM 是一堆廢鐵。
     2.  初始化基本 Console (UART) 以便 Debug。
-    3.  將完整 U-Boot 載入到 **DRAM**。
+    3.  將完整 **U-Boot Proper** 載入到 **DRAM**。
     4.  跳轉到 DRAM 執行。
 
-### 3. Stage 2: U-Boot (Proper)
+### 3. Stage 2: U-Boot Proper (第三階段 Bootloader)
+> **術語定義**: `U-Boot Proper` 指的是功能完整的 `u-boot.bin` 或 `u-boot.img`，執行於 DRAM。
 -   **環境**: 擁有完整 DRAM 空間，功能強大。
 -   **任務**:
     1.  **Relocation**: 把自己搬到 RAM 頂端，騰出低位址給 Kernel。
@@ -72,6 +76,7 @@ Secure Boot 就像海關檢查。每一站都要檢查下一站的護照 (簽章
 ## 🔷 Logic II: 韌體架構與 ATF
 
 ### 1. ATF (ARM Trusted Firmware) / TF-A
+> **Note**: 這主要針對 **ARMv8 (64-bit)** 架構。對於 ARMv7 (如 AST2600)，安全性通常由 Secure Boot Hardware 或 OpTEE 處理，而不稱作 ATF BL31。
 在 ARMv8 (64-bit) 架構中，多了一個 **Secure World** (EL3)。
 -   **BL31**: ATF 的 Runtime Service，常駐 EL3。
 -   **功能**:
@@ -116,8 +121,8 @@ SPL 的 Linker Script 必須指定 `TTEXT_BASE` 為 SRAM 起始位址。
 
 ### Q1: 為什麼 ARM 開機需要 SPL？直接跑 U-Boot 不行嗎？
 -   **硬體限制**: 系統剛上電時，DRAM **不可用**。只有 SoC 內部極小的 SRAM (通常 <100KB) 可用。
--   **大小問題**: 現代 U-Boot 編譯出來通常 >500KB，塞不進 SRAM。
--   **解法**: 先跑一個小巧的 SPL (負責初始化 DRAM)，有了大記憶體後，再載入完整 U-Boot。
+-   **大小問題**: 現代 **U-Boot Proper** 編譯出來通常 >500KB，塞不進 SRAM。
+-   **解法**: 先跑一個小巧的 SPL (負責初始化 DRAM)，有了大記憶體後，再載入完整 **U-Boot Proper**。
 
 ### Q2: 什麼是 ATF (TF-A)？PSCI 是什麼？
 -   **ATF**: ARM Trusted Firmware，運行在 **EL3 (Secure Monitor)** 的特權韌體，負責系統安全與電源管理。
@@ -127,11 +132,11 @@ SPL 的 Linker Script 必須指定 `TTEXT_BASE` 為 SRAM 起始位址。
 -   **Root**: OTP 中的 Hash/Public Key (硬體信任根)。
 -   **Flow**:
     1.  ROM 驗 SPL。
-    2.  SPL 驗 U-Boot (通常包在 FIT 中)。
-    3.  U-Boot 驗 Kernel (FIT Image Signature)。
+    2.  SPL 驗 U-Boot Proper (通常包在 FIT 中)。
+    3.  U-Boot Proper 驗 Kernel (FIT Image Signature)。
 -   **關鍵**: 每一級在執行下一級代碼前，**必須**先驗證其完整性與來源。
 
-### Q4: U-Boot 跳轉到 Linux Kernel 前要做什麼準備？(Handoff 要求)
+### Q4: U-Boot Proper 跳轉到 Linux Kernel 前要做什麼準備？(Handoff 要求)
 -   **清理現場**:
     1.  關閉中斷 (Interrupts)。
     2.  關閉 MMU。
@@ -140,6 +145,19 @@ SPL 的 Linker Script 必須指定 `TTEXT_BASE` 為 SRAM 起始位址。
     -   **ARM32**: `r0=0`, `r1=Machine ID`, `r2=DTB Address`。
     -   **ARM64**: `x0=DTB Address`, CPU 處於 EL2 或 EL1。
 
-### Q5: U-Boot 的 `board_init_f` 和 `board_init_r` 有何不同？
--   **`_f` (Flash/Front)**: 執行在 **SRAM**。只能做最基礎初始化 (Console, DRAM)。Stack 在 SRAM 或 Cache。
--   **`_r` (RAM/Rear)**: 執行在 **DRAM**。記憶體無虞，可以做複雜任務 (Network, PCI, Flash Read)，並最終載入 OS。
+### Q5: U-Boot 的 `board_init_f` 和 `board_init_r` 有何不同？ (重要觀念釐清)
+> **注意**：這兩個函式在 **SPL** 和 **U-Boot Proper** (完整版) 都會執行，但 Context 不同。
+
+**1. 在 SPL 階段 (SRAM Context):**
+*   **`board_init_f` (Front)**: 真的在 **SRAM** 執行。
+    *   **任務**: 初始化 **DRAM** (最核心任務)、關閉 Watchdog、基本 Console。
+    *   **限制**: 只有 SRAM，Stack 在 SRAM，不可用 Global Variables (BSS 未初始化)。
+*   **`board_init_r` (Rear)**:
+    *   **任務**: 載入 **U-Boot Proper** 到 DRAM，然後跳轉。
+
+**2. 在 U-Boot Proper 階段 (DRAM Context):**
+*   **`board_init_f` (Front)**: 雖然已經在 DRAM 運行，但在 **Relocation 之前**。
+    *   **任務**: 預留記憶體空間 (為 Relocation 做準備)，計算搬移位置。
+    *   **迷思釐清**: 很多人誤以為這裡還在初始化 DRAM，其實 DRAM 在 SPL 早就好了。
+*   **`board_init_r` (Rear)**: 在 **Relocation 之後** (Code 已搬到 DRAM 高位址)。
+    *   **任務**: 完整的硬體初始化 (Network, USB, PCI, Mass Storage)，並進入 `main_loop` 等待指令或載入 Kernel。
